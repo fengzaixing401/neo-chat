@@ -28,5 +28,10 @@
     // Keep only non-sensitive deployment defaults here. Set per-deployment
     // secrets and user-specific defaults in the Cloudflare dashboard.
     "DEPLOYMENT_MODE": "hosted",
+    "RATE_LIMIT_STORE": "upstash",
+    "DOCUMENT_PARSE_JOB_STORE": "upstash",
+    "PLUGIN_REGISTRY_STORE": "upstash",
+    "BYOK_ALLOW_EPHEMERAL_KEY": "false",
+    "NEXT_PUBLIC_SITE_URL": "https://neo.fzx.f5.si",
   },
 }
