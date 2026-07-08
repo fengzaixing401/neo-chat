@@ -13,7 +13,7 @@ import {
   getSafeUrlPolicy,
 } from "../security/urlPolicy";
 import { assertOutboundUrlAllowed } from "../security/safeFetch";
-import { getDeploymentMode, getOutboundPolicyProfile } from "../security/deployment";
+import { getDeploymentMode } from "../security/deployment";
 import { isOpenAIProviderType } from "./providerTypes";
 
 export type ProviderConfig = ProviderRuntimeConfig;
@@ -70,7 +70,6 @@ export class ProviderFactory {
     const rawBaseUrl = provider.baseUrl?.trim();
     if (!rawBaseUrl || rawBaseUrl === "default") return;
     if (getDeploymentMode() !== "hosted") return;
-    if (getOutboundPolicyProfile().allowLocalNetworkProxy) return;
 
     const customBaseUrl = this.getEffectiveBaseUrl(rawBaseUrl, providerType);
     const officialBaseUrl = this.getEffectiveBaseUrl(undefined, providerType);

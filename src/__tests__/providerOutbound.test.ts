@@ -39,23 +39,9 @@ describe("provider outbound policy", () => {
       ProviderFactory.createOpenAIClient({
         type: "OpenAI",
         baseUrl: "https://proxy.example/v1",
-        apiKey: "test-key",
+        apiKey: "key",
       }),
     ).toThrow(/Custom provider base URLs are disabled in hosted mode/i);
-  });
-
-  it("allows custom provider SDK base URLs in hosted mode when local network proxy override is enabled", async () => {
-    vi.stubEnv("DEPLOYMENT_MODE", "hosted");
-    vi.stubEnv("ALLOW_LOCAL_NETWORK_PROXY", "true");
-    const { ProviderFactory } = await import("../lib/providers/base");
-
-    expect(() =>
-      ProviderFactory.createOpenAIClient({
-        type: "OpenAI",
-        baseUrl: "https://proxy.example/v1",
-        apiKey: "test-key",
-      }),
-    ).not.toThrow();
   });
 
   it("keeps official provider base URLs available in hosted mode", async () => {
