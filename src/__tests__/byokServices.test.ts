@@ -62,6 +62,10 @@ vi.mock("@/lib/settings/searchRag", () => ({
 }));
 
 vi.mock("@/lib/utils/contextCompression", () => ({
+  buildCompressionSource: vi.fn(() => ({
+    text: "",
+    includedMemoryIds: [],
+  })),
   createContextCompressionSummaryPrompt: vi.fn(() => ""),
   mergeCompressedContent: vi.fn((value) => value),
   normalizeCompressedContent: vi.fn((value) => value),
@@ -89,7 +93,7 @@ vi.mock("../lib/api/client", async () => {
 const providerWithoutLocalKey: ModelProvider = {
   id: "env-provider",
   name: "Env Gemini",
-  type: "Gemini",
+  type: "Google",
   baseUrl: "https://generativelanguage.googleapis.com",
   apiKey: "",
   enabled: true,
@@ -143,7 +147,7 @@ describe("BYOK service requests", () => {
     );
     const body = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body));
     expect(body.provider).toMatchObject({
-      type: "Gemini",
+      type: "Google",
       name: "Env Gemini",
     });
     expect(JSON.stringify(body)).not.toContain("apiKey");
@@ -182,6 +186,29 @@ describe("BYOK service requests", () => {
     }
   });
 
+  it("passes AbortSignal through auxiliary client requests", async () => {
+    const controller = new AbortController();
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(Response.json({ title: "Title" }))
+      .mockResolvedValueOnce(Response.json({ questions: [] }))
+      .mockResolvedValueOnce(Response.json({ queries: ["query"] }));
+    const {
+      generateChatTitle,
+      generateRAGSearchQueries,
+      generateRelatedQuestions,
+    } = await import("../services/api/chatService");
+
+    await generateChatTitle([], controller.signal);
+    await generateRelatedQuestions([], controller.signal);
+    await generateRAGSearchQueries("hello", controller.signal);
+
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    for (const call of fetchMock.mock.calls) {
+      expect(call[1]?.signal).toBe(controller.signal);
+    }
+  });
+
   it("allows voice model STT to use server env fallback without sending apiKey", async () => {
     const fetchMock = vi
       .spyOn(globalThis, "fetch")
@@ -205,7 +232,7 @@ describe("BYOK service requests", () => {
     const body = fetchMock.mock.calls[0]?.[1]?.body as FormData;
     const modelProvider = JSON.parse(String(body.get("modelProvider")));
     expect(modelProvider).toMatchObject({
-      type: "Gemini",
+      type: "Google",
       name: "Env Gemini",
     });
     expect(JSON.stringify(modelProvider)).not.toContain("apiKey");
@@ -226,7 +253,7 @@ describe("BYOK service requests", () => {
 
     const body = getJsonRequestBody(fetchMock);
     expect(body.modelProvider).toMatchObject({
-      type: "Gemini",
+      type: "Google",
       name: "Env Gemini",
     });
     expect(JSON.stringify(body)).not.toContain("apiKey");

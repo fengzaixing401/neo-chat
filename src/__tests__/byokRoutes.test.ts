@@ -202,6 +202,7 @@ describe("BYOK route integration", () => {
   });
 
   it("routes OpenAI Compatible image generation to the Images generations endpoint", async () => {
+    const controller = new AbortController();
     mocks.resolveProviderRuntimeConfig.mockResolvedValue({
       type: "OpenAI Compatible",
       baseUrl: "https://api.krill-ai.com/v1",
@@ -215,26 +216,27 @@ describe("BYOK route integration", () => {
     });
 
     const { POST } = await import("../app/api/chat/generate-image/route");
-    const response = await POST(
-      new Request("https://neo.test/api/chat/generate-image", {
-        method: "POST",
-        body: JSON.stringify({
-          provider: {
-            type: "OpenAI Compatible",
-            baseUrl: "https://api.krill-ai.com/v1",
-            apiKeySecret,
-          },
-          modelName: "gpt-image-2",
-          prompt: "draw a quiet dashboard",
-        }),
-      }) as any,
-    );
+    const request = new Request("https://neo.test/api/chat/generate-image", {
+      method: "POST",
+      signal: controller.signal,
+      body: JSON.stringify({
+        provider: {
+          type: "OpenAI Compatible",
+          baseUrl: "https://api.krill-ai.com/v1",
+          apiKeySecret,
+        },
+        modelName: "gpt-image-2",
+        prompt: "draw a quiet dashboard",
+      }),
+    });
+    const response = await POST(request as any);
 
     expect(response.status).toBe(200);
     expect(mocks.safeFetchJson).toHaveBeenCalledWith(
       "https://api.krill-ai.com/v1/images/generations",
       expect.objectContaining({
         method: "POST",
+        signal: request.signal,
         headers: expect.objectContaining({
           Authorization: "Bearer krill-key",
         }),
@@ -447,6 +449,32 @@ describe("BYOK route integration", () => {
     );
   });
 
+  it("returns a stable validation error for malformed document parser secret JSON", async () => {
+    const { POST } = await import("../app/api/doc-parse/route");
+    const formData = new FormData();
+    formData.set(
+      "file",
+      new File(["hello"], "notes.txt", { type: "text/plain" }),
+    );
+    formData.set("provider", "mineru");
+    formData.set("apiKeySecret", "{not-json");
+
+    const response = await POST(
+      new Request("https://neo.test/api/doc-parse", {
+        method: "POST",
+        headers: { "content-length": "2048" },
+        body: formData,
+      }) as any,
+    );
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({
+      code: "INVALID_SECRET_JSON",
+    });
+    expect(mocks.decryptSecretEnvelope).not.toHaveBeenCalled();
+    expect(mocks.safeFetchJson).not.toHaveBeenCalled();
+  });
+
   it("rejects plaintext voice API keys in transcription multipart requests", async () => {
     const { POST } = await import("../app/api/voice/transcribe/route");
     const formData = new FormData();
@@ -475,6 +503,32 @@ describe("BYOK route integration", () => {
     expect(JSON.stringify(await response.json())).not.toContain(
       "voice-plaintext",
     );
+  });
+
+  it("returns a stable validation error for malformed voice secret JSON", async () => {
+    const { POST } = await import("../app/api/voice/transcribe/route");
+    const formData = new FormData();
+    formData.set(
+      "audio",
+      new File(["audio"], "speech.webm", { type: "audio/webm" }),
+    );
+    formData.set("provider", "elevenlabs");
+    formData.set("apiKeySecret", "{not-json");
+
+    const response = await POST(
+      new Request("https://neo.test/api/voice/transcribe", {
+        method: "POST",
+        headers: { "content-length": "2048" },
+        body: formData,
+      }) as any,
+    );
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({
+      code: "INVALID_SECRET_JSON",
+    });
+    expect(mocks.decryptSecretEnvelope).not.toHaveBeenCalled();
+    expect(mocks.safeFetchJson).not.toHaveBeenCalled();
   });
 
   it("rejects transcription multipart requests without a trustworthy content length before parsing", async () => {

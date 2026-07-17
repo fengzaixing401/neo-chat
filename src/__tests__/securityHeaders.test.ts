@@ -19,6 +19,11 @@ function getDirective(csp: string, directive: string): string {
 }
 
 describe("security headers", () => {
+  it("does not upgrade self-hosted HTTP requests to HTTPS", () => {
+    expect(getCspValue("local")).not.toContain("upgrade-insecure-requests");
+    expect(getCspValue("hosted")).not.toContain("upgrade-insecure-requests");
+  });
+
   it("keeps local development CSP permissive enough for local proxies", () => {
     const csp = getCspValue("local");
 
@@ -31,6 +36,8 @@ describe("security headers", () => {
     const csp = getCspValue("hosted");
 
     expect(getDirective(csp, "script-src")).not.toContain("'unsafe-eval'");
+    expect(getDirective(csp, "script-src")).not.toContain("'unsafe-inline'");
+    expect(getDirective(csp, "script-src")).toContain("'sha256-");
     expect(getDirective(csp, "img-src")).not.toContain("http:");
     expect(getDirective(csp, "connect-src")).not.toContain("http:");
   });

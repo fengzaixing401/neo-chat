@@ -13,7 +13,7 @@ import { safeFetchJson } from "@/lib/security/safeFetch";
 import {
   runSearchProvider,
   SearchProviderError,
-} from "../../../lib/search/providerAdapters";
+} from "@/lib/search/providerAdapters";
 import { BYOK_CONTEXTS } from "@/lib/byok/shared";
 import { decryptOptionalSecret } from "@/lib/byok/server";
 import { getDefaultSearchRuntimeConfig } from "@/lib/defaultConfig/server";
@@ -53,6 +53,7 @@ export async function POST(request: NextRequest) {
         baseUrl,
         maxResultNumber,
         fetchJson: safeFetchJson,
+        signal: request.signal,
       });
     } catch (error) {
       if (error instanceof SearchProviderError) {
@@ -69,6 +70,12 @@ export async function POST(request: NextRequest) {
       images: normalizeImageSources(searchResults.images),
     });
   } catch (error) {
+    if (
+      request.signal.aborted ||
+      (error instanceof Error && error.name === "AbortError")
+    ) {
+      return new Response(null, { status: 499 });
+    }
     safeServerLogError("Search error:", error);
     return createApiErrorResponse(error, "Search failed");
   }

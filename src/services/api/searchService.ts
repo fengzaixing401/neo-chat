@@ -1,22 +1,25 @@
 import { Source, ImageSource } from "@/types";
 import { useSettingsStore } from "@/store/core/settingsStore";
-import { readJsonResponseOrThrow, signedApiFetch } from "../../lib/api/client";
+import { readJsonResponseOrThrow, signedApiFetch } from "@/lib/api/client";
 import {
   normalizeImageSources,
   normalizeSearchSources,
-} from "../../lib/search/results";
+} from "@/lib/search/results";
 import {
   buildSearchRuntimeConfig,
   fetchWithByokRetry,
-} from "../../lib/byok/client";
-import { logDevError } from "../../lib/utils/devLogger";
+} from "@/lib/byok/client";
+import { logDevError } from "@/lib/utils/devLogger";
 
 export interface SearchOptions {
   query: string;
   scope?: string;
 }
 
-export async function createSearchProvider({ query, scope }: SearchOptions) {
+export async function createSearchProvider(
+  { query, scope }: SearchOptions,
+  signal?: AbortSignal,
+) {
   const { search } = useSettingsStore.getState();
   const provider = search.provider;
   if (provider === "google") {
@@ -37,9 +40,10 @@ export async function createSearchProvider({ query, scope }: SearchOptions) {
           provider,
           query,
           scope,
-          config: await buildSearchRuntimeConfig(provider, config),
+          config: await buildSearchRuntimeConfig(provider, config, signal),
           maxResult,
         }),
+        signal,
       }),
     );
 
@@ -56,6 +60,12 @@ export async function createSearchProvider({ query, scope }: SearchOptions) {
       images: normalizeImageSources(data.images),
     };
   } catch (error) {
+    if (
+      signal?.aborted ||
+      (error instanceof Error && error.name === "AbortError")
+    ) {
+      throw error;
+    }
     logDevError("Search error:", error);
     throw error;
   }

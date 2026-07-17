@@ -51,11 +51,12 @@ const secret = {
   context: "plugin:test-plugin:auth",
 } as const;
 
-function createRequest(body: unknown) {
+function createRequest(body: unknown, signal?: AbortSignal) {
   return new Request("http://localhost/api/plugins/execute", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
+    signal,
   });
 }
 
@@ -114,6 +115,81 @@ describe("plugin execute route", () => {
   });
 
   it("adds API key auth to query parameters and keeps response size capped", async () => {
+    const controller = new AbortController();
+    decryptOptionalSecretMock.mockResolvedValue("secret-value");
+    safeFetchTextMock.mockResolvedValue({
+      response: new Response(null, { status: 200 }),
+      text: JSON.stringify({ ok: true }),
+    });
+
+    const { POST } = await import("../app/api/plugins/execute/route");
+    const request = createRequest(
+      {
+        plugin: {
+          id: "test-plugin",
+          baseUrl: "https://api.example.com",
+          auth: { type: "apiKey", name: "token", in: "query" },
+          functions: [{ name: "lookup", path: "/items/{id}", method: "GET" }],
+        },
+        functionDef: {
+          name: "lookup",
+          path: "/items/{id}",
+          method: "GET",
+        },
+        args: { id: "abc", q: "neo" },
+        authConfig: {
+          type: "apiKey",
+          addTo: "query",
+          key: "token",
+          valueSecret: secret,
+        },
+      },
+      controller.signal,
+    );
+    const response = await POST(request as any);
+
+    expect(response.status).toBe(200);
+    expect(safeFetchTextMock).toHaveBeenCalledWith(
+      "https://api.example.com/items/abc?q=neo&token=secret-value",
+      expect.objectContaining({
+        method: "GET",
+        signal: request.signal,
+      }),
+      expect.objectContaining({ maxResponseBytes: 2 * 1024 * 1024 }),
+    );
+  });
+
+  it("rejects plugin auth header names that would override request routing", async () => {
+    decryptOptionalSecretMock.mockResolvedValue("secret-value");
+
+    const { POST } = await import("../app/api/plugins/execute/route");
+    const response = await POST(
+      createRequest({
+        plugin: {
+          id: "test-plugin",
+          baseUrl: "https://api.example.com",
+          auth: { type: "apiKey", in: "header" },
+          functions: [{ name: "lookup", path: "/items", method: "GET" }],
+        },
+        functionDef: { name: "lookup", path: "/items", method: "GET" },
+        args: {},
+        authConfig: {
+          type: "apiKey",
+          addTo: "header",
+          key: "Host",
+          valueSecret: secret,
+        },
+      }) as any,
+    );
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({
+      error: "Plugin authentication header name is not allowed",
+    });
+    expect(safeFetchTextMock).not.toHaveBeenCalled();
+  });
+
+  it("does not let runtime plugin auth config override manifest auth location", async () => {
     decryptOptionalSecretMock.mockResolvedValue("secret-value");
     safeFetchTextMock.mockResolvedValue({
       response: new Response(null, { status: 200 }),
@@ -127,14 +203,14 @@ describe("plugin execute route", () => {
           id: "test-plugin",
           baseUrl: "https://api.example.com",
           auth: { type: "apiKey", name: "token", in: "query" },
-          functions: [{ name: "lookup", path: "/items/{id}", method: "GET" }],
+          functions: [{ name: "lookup", path: "/items", method: "GET" }],
         },
-        functionDef: { name: "lookup", path: "/items/{id}", method: "GET" },
-        args: { id: "abc", q: "neo" },
+        functionDef: { name: "lookup", path: "/items", method: "GET" },
+        args: {},
         authConfig: {
           type: "apiKey",
-          addTo: "query",
-          key: "token",
+          addTo: "header",
+          key: "X-API-Key",
           valueSecret: secret,
         },
       }) as any,
@@ -142,9 +218,13 @@ describe("plugin execute route", () => {
 
     expect(response.status).toBe(200);
     expect(safeFetchTextMock).toHaveBeenCalledWith(
-      "https://api.example.com/items/abc?q=neo&token=secret-value",
-      expect.objectContaining({ method: "GET" }),
-      expect.objectContaining({ maxResponseBytes: 2 * 1024 * 1024 }),
+      "https://api.example.com/items?token=secret-value",
+      expect.objectContaining({
+        headers: expect.not.objectContaining({
+          "X-API-Key": "secret-value",
+        }),
+      }),
+      expect.any(Object),
     );
   });
 

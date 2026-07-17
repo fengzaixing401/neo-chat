@@ -4,7 +4,12 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 vi.mock("server-only", () => ({}));
 
 import { clearByokPublicKeyCache, encryptSecret } from "../lib/byok/client";
-import { decryptSecretEnvelope, getByokPublicKey } from "../lib/byok/server";
+import {
+  decryptSecretEnvelope,
+  getByokPublicKey,
+  resolveProviderRuntimeConfig,
+} from "../lib/byok/server";
+import { ProviderRuntimeConfigSchema } from "../lib/api/schemas";
 import {
   clearLocalSecretKeyCache,
   encryptLocalSecret,
@@ -38,6 +43,7 @@ function resetByokKeyMaterial() {
 
 describe("BYOK secret envelopes", () => {
   afterEach(() => {
+    vi.useRealTimers();
     vi.restoreAllMocks();
     restoreEnv();
     resetByokKeyMaterial();
@@ -105,6 +111,66 @@ describe("BYOK secret envelopes", () => {
     await expect(
       freshEncryptSecret("secret", "provider:Gemini"),
     ).rejects.toThrow(/Invalid BYOK RSA public key/);
+  });
+
+  it("cancels a caller waiting for the shared public key request", async () => {
+    vi.resetModules();
+    const {
+      clearByokPublicKeyCache: clearFreshCache,
+      encryptSecret: freshEncryptSecret,
+    } = await import("../lib/byok/client");
+    let requestSignal: AbortSignal | undefined;
+    vi.spyOn(globalThis, "fetch").mockImplementation(
+      (_input, init) =>
+        new Promise<Response>((_resolve, reject) => {
+          requestSignal = init?.signal || undefined;
+          requestSignal?.addEventListener(
+            "abort",
+            () => reject(new DOMException("Aborted", "AbortError")),
+            { once: true },
+          );
+        }),
+    );
+    const controller = new AbortController();
+
+    const pending = freshEncryptSecret(
+      "secret",
+      "provider:Gemini",
+      controller.signal,
+    );
+    controller.abort();
+
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+    expect(requestSignal?.aborted).toBe(false);
+
+    clearFreshCache();
+    expect(requestSignal?.aborted).toBe(true);
+  });
+
+  it("reports the public-key watchdog as a timeout, not caller cancellation", async () => {
+    vi.useFakeTimers();
+    vi.resetModules();
+    const { encryptSecret: freshEncryptSecret } =
+      await import("../lib/byok/client");
+    vi.spyOn(globalThis, "fetch").mockImplementation((_input, init) => {
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener(
+          "abort",
+          () => reject(init.signal?.reason),
+          { once: true },
+        );
+      });
+    });
+
+    const request = freshEncryptSecret("secret", "provider:Gemini");
+    const expectation = expect(request).rejects.toMatchObject({
+      name: "ResponseTimeoutError",
+      code: "RESPONSE_TIMEOUT",
+      statusCode: 504,
+    });
+    await vi.advanceTimersByTimeAsync(30_000);
+
+    await expectation;
   });
 
   it("refreshes the public key and retries BYOK auth failures once", async () => {
@@ -205,6 +271,29 @@ describe("BYOK secret envelopes", () => {
     ).resolves.toBe("sk-test-secret");
   });
 
+  it("decrypts legacy Gemini provider envelopes after provider type normalization", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(async () =>
+      Response.json(await getByokPublicKey()),
+    );
+
+    const envelope = await encryptSecret(
+      "legacy-gemini-secret",
+      "provider:Gemini",
+    );
+    const provider = ProviderRuntimeConfigSchema.parse({
+      type: "Gemini",
+      apiKeySecret: envelope,
+    });
+
+    expect(provider.type).toBe("Google");
+    await expect(resolveProviderRuntimeConfig(provider)).resolves.toMatchObject(
+      {
+        type: "Google",
+        apiKey: "legacy-gemini-secret",
+      },
+    );
+  });
+
   it("builds provider BYOK envelopes from encrypted local secrets", async () => {
     vi.resetModules();
     resetByokKeyMaterial();
@@ -225,7 +314,7 @@ describe("BYOK secret envelopes", () => {
     const runtime = await buildProviderRuntimeConfig({
       id: "LOCAL1",
       name: "Local Gemini",
-      type: "Gemini",
+      type: "Google",
       baseUrl: "https://generativelanguage.googleapis.com",
       apiKey: "",
       apiKeySecret,
@@ -236,7 +325,7 @@ describe("BYOK secret envelopes", () => {
 
     expect(JSON.stringify(runtime)).not.toContain("local-provider-secret");
     await expect(
-      freshDecryptSecretEnvelope(runtime.apiKeySecret!, "provider:Gemini"),
+      freshDecryptSecretEnvelope(runtime.apiKeySecret!, "provider:Google"),
     ).resolves.toBe("local-provider-secret");
   });
 

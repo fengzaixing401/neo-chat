@@ -10,32 +10,37 @@ describe("MessageItem composition", () => {
       resolve(process.cwd(), "src/components/chat/MessageItem.tsx"),
       "utf8",
     );
+    const userMessageEditor = readFileSync(
+      resolve(process.cwd(), "src/components/chat/UserMessageEditor.tsx"),
+      "utf8",
+    );
+    const messageItemSurface = `${messageItem}\n${userMessageEditor}`;
     const attachmentView = readFileSync(
       resolve(process.cwd(), "src/components/chat/MessageAttachmentView.tsx"),
       "utf8",
     );
 
-    expect(messageItem).toContain("MessageAttachmentView");
-    expect(messageItem).toContain(
+    expect(messageItemSurface).toContain("MessageAttachmentView");
+    expect(messageItemSurface).toContain(
       "const skillInvocations = message.skillInvocations || []",
     );
-    expect(messageItem).toContain("portal");
-    expect(messageItem).toContain("AddToKnowledgeModal");
-    expect(messageItem).toContain("handleAddToKnowledge");
-    expect(messageItem).toContain("canEditUserMessage");
-    expect(messageItem).toContain("UserMessageEditor");
-    expect(messageItem).toContain("focus-within:ring-2");
-    expect(messageItem).toContain("focus-visible:ring-ring");
-    expect(messageItem).toContain("PencilSparkles");
-    expect(messageItem).toContain('t("polishUserMessageShort")');
-    expect(messageItem).not.toContain("text-amber-500");
-    expect(messageItem).not.toContain("hover:bg-amber-50");
-    expect(messageItem).not.toContain("dark:text-amber-300");
-    expect(messageItem).not.toContain("PencilSparklesIcon");
-    expect(messageItem).not.toContain("const AttachmentView");
-    expect(messageItem).not.toContain("activeSkillIds");
-    expect(messageItem).not.toContain("onBranch");
-    expect(messageItem).not.toContain("<Split");
+    expect(messageItemSurface).toContain("portal");
+    expect(messageItemSurface).toContain("AddToKnowledgeModal");
+    expect(messageItemSurface).toContain("handleAddToKnowledge");
+    expect(messageItemSurface).toContain("canEditUserMessage");
+    expect(messageItemSurface).toContain("UserMessageEditor");
+    expect(messageItemSurface).toContain("focus-within:ring-2");
+    expect(messageItemSurface).toContain("focus-visible:ring-ring");
+    expect(messageItemSurface).toContain("PencilSparkles");
+    expect(messageItemSurface).toContain('t("polishUserMessageShort")');
+    expect(messageItemSurface).not.toContain("text-amber-500");
+    expect(messageItemSurface).not.toContain("hover:bg-amber-50");
+    expect(messageItemSurface).not.toContain("dark:text-amber-300");
+    expect(messageItemSurface).not.toContain("PencilSparklesIcon");
+    expect(messageItemSurface).not.toContain("const AttachmentView");
+    expect(messageItemSurface).not.toContain("activeSkillIds");
+    expect(messageItemSurface).not.toContain("onBranch");
+    expect(messageItemSurface).not.toContain("<Split");
     expect(attachmentView).toContain("AudioPlayer");
     expect(attachmentView).toContain("resolveObjectUrlWithLifecycle");
   });
@@ -89,12 +94,31 @@ describe("MessageItem composition", () => {
       resolve(process.cwd(), "src/app/globals.css"),
       "utf8",
     );
+    const messageOutputRenderer = readFileSync(
+      resolve(
+        process.cwd(),
+        "src/components/content/MessageOutputRenderer.tsx",
+      ),
+      "utf8",
+    );
     const packageJson = JSON.parse(
       readFileSync(resolve(process.cwd(), "package.json"), "utf8"),
     ) as { dependencies?: Record<string, string> };
 
     expect(messageItem).toContain("handleDownloadMarkdown");
     expect(messageItem).toContain("handleDownloadPdf");
+    expect(messageItem).toContain("beginDownload");
+    expect(messageItem).toContain("finishDownload");
+    expect(messageItem).toContain("downloadingFormat");
+    expect(messageItem).toContain('t("downloadInProgress")');
+    expect(messageItem).toContain("aria-busy={isDownloading}");
+    expect(messageItem).toContain("disabled={isDownloading}");
+    expect(messageItem).toContain("hideReasoning");
+    expect(messageItem).toContain("hideToolCalls");
+    expect(messageOutputRenderer).toContain("hideReasoning?: boolean");
+    expect(messageOutputRenderer).toContain("hideToolCalls?: boolean");
+    expect(messageOutputRenderer).toContain("if (hideReasoning) return null;");
+    expect(messageOutputRenderer).toContain("if (hideToolCalls) return null;");
     expect(messageItem).toContain("handleDownloadImage");
     expect(messageItem).toContain("imageExportError");
     expect(messageItem).toContain('t("downloadImageFailed")');
@@ -110,6 +134,8 @@ describe("MessageItem composition", () => {
     expect(messageItem).toContain("backgroundColor");
     expect(messageItem).toContain("getImageExportBackgroundColor");
     expect(messageItem).toContain("getMessageImageExportWidth");
+    expect(messageItem).toContain("cacheBust: false");
+    expect(messageItem).not.toContain("cacheBust: true");
     expect(messageItem).toContain("visibleMessageContentRef");
     expect(messageItem).toContain("width: imageExportJob.width");
     expect(messageItem).toContain("canvasWidth: imageExportJob.width");
@@ -118,9 +144,23 @@ describe("MessageItem composition", () => {
     expect(messageItem).toContain("forceExpandCodeBlocks");
     expect(messageItem).toContain("MessageOutputRenderer");
     expect(messageItem).toContain("proxyMessageExportImages");
-    expect(messageItem).toContain("https://serveproxy.com/?url=");
-    expect(messageItem).toContain("encodeURIComponent");
+    expect(messageItem).toContain("MESSAGE_IMAGE_PROXY_PATH");
+    expect(messageItem).toContain("signedApiFetch");
+    expect(messageItem).toContain("URL.createObjectURL");
+    expect(messageItem).toContain("URL.revokeObjectURL");
+    expect(messageItem).not.toContain("serveproxy.com");
     expect(messageItem).toContain("waitForMessageExportImages");
+    const runExportStart = messageItem.indexOf(
+      "const runExport = async () => {",
+    );
+    const runExportEnd = messageItem.indexOf(
+      "firstFrame = requestAnimationFrame",
+      runExportStart,
+    );
+    const runExport = messageItem.slice(runExportStart, runExportEnd);
+    expect(runExport.indexOf("await proxyMessageExportImages")).toBeLessThan(
+      runExport.indexOf("await exportRootToPng"),
+    );
     expect(messageItem).toContain("DropdownMenuSub");
     expect(messageItem).toContain("DropdownMenuSubTrigger");
     expect(messageItem).toContain("DropdownMenuSubContent");
@@ -141,13 +181,21 @@ describe("MessageItem composition", () => {
       ),
       "utf8",
     );
-    expect(markdownRenderer).toContain("forcedTheme?: DiagramTheme");
-    expect(markdownRenderer).toContain("forcedTheme || resolvedTheme");
-    expect(markdownRenderer).toContain("forceExpandCodeBlocks?: boolean");
-    expect(markdownRenderer).toContain(
+    const diagramBlock = readFileSync(
+      resolve(
+        process.cwd(),
+        "src/components/content/markdown/DiagramBlock.tsx",
+      ),
+      "utf8",
+    );
+    const markdownSurface = `${markdownRenderer}\n${diagramBlock}`;
+    expect(markdownSurface).toContain("forcedTheme?: DiagramTheme");
+    expect(markdownSurface).toContain("forcedTheme || resolvedTheme");
+    expect(markdownSurface).toContain("forceExpandCodeBlocks?: boolean");
+    expect(markdownSurface).toContain(
       "!forceExpandCodeBlocks && (system.enableCodeCollapse ?? true)",
     );
-    expect(markdownRenderer).toContain(
+    expect(markdownSurface).toContain(
       "forceExpandCodeBlocks={forceExpandCodeBlocks}",
     );
 
@@ -175,10 +223,12 @@ describe("MessageItem composition", () => {
     expect(en.Message.downloadMarkdown).toBe("Markdown");
     expect(en.Message.downloadPdf).toBe("PDF");
     expect(en.Message.downloadImage).toBe("Image");
+    expect(en.Message.downloadInProgress).toBe("Downloading…");
     expect(en.Message.downloadFormat).toBe("Download format");
     expect(zh.Message.downloadMarkdown).toBe("Markdown");
     expect(zh.Message.downloadPdf).toBe("PDF");
     expect(zh.Message.downloadImage).toBe("图片");
+    expect(zh.Message.downloadInProgress).toBe("下载中…");
     expect(zh.Message.downloadFormat).toBe("下载格式");
   });
 });

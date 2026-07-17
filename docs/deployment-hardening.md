@@ -13,12 +13,18 @@ Recommended settings:
 
 ```bash
 DEPLOYMENT_MODE=local
+ACCESS_PASSWORD=choose-a-strong-password
+ALLOW_INSECURE_LOCAL_PRODUCTION=false
 ALLOW_LOCAL_NETWORK_PROXY=
 TRUST_PROXY_HEADERS=false
 BYOK_ALLOW_EPHEMERAL_KEY=false
 BYOK_PRIVATE_KEY_PEM="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----"
 BYOK_KEY_ID=prod-2026-07
 ```
+
+Production `local` mode now fails closed for `/api/*` when `ACCESS_PASSWORD` is
+empty. Set `ALLOW_INSECURE_LOCAL_PRODUCTION=true` only for a private deployment
+that is not exposed to the internet and has another access boundary.
 
 If the deployment has more than one instance, use Upstash for shared request
 limits, document parse jobs, and server-registered plugins:
@@ -111,8 +117,31 @@ Build command: pnpm build:worker
 Deploy command: pnpm exec opennextjs-cloudflare deploy -- --keep-vars
 ```
 
+OpenNext Cloudflare compatibility requires this repository to keep its Edge
+Middleware entry point at `src/middleware.ts`.
+Do not rename it to `src/proxy.ts`: the proxy entry point is emitted as Node.js
+middleware by the current Next.js toolchain, which OpenNext Cloudflare does not
+support. The middleware must also keep `/api/access/verify` and
+`/api/request-proof/session` available as bootstrap routes.
+
+Use Node 22 with Corepack-enabled `pnpm@10.30.3` for local, CI, Docker, and
+Cloudflare build parity. Before deploying Worker changes, run:
+
+```bash
+pnpm build:worker
+pnpm worker:size
+```
+
+`pnpm worker:size` runs `wrangler deploy --dry-run`, reads the gzip value from
+Wrangler's `Total Upload` report, and checks it against the default 3 MiB
+budget. The command fails if Wrangler fails, the report cannot be parsed, or
+the gzip value exceeds the budget. Override with `WORKER_GZIP_BUDGET_BYTES`
+only for an intentional budget change.
+
 `--keep-vars` prevents deployments from replacing runtime variables configured
 in the Cloudflare dashboard with only the values committed in `wrangler.jsonc`.
+The default observability sampling in `wrangler.jsonc` is production-oriented;
+temporarily raise sampling while debugging noisy incidents, then lower it again.
 
 Set runtime variables in the Worker dashboard under **Settings -> Variables and
 Secrets**. Use plain variables only for non-sensitive deployment defaults:
@@ -159,6 +188,13 @@ a plugin is enabled for a chat, runtime tool calls execute automatically without
 a per-call confirmation modal. See [Reliability and Safety Model](reliability-and-safety.md)
 for tool execution boundaries, context budgeting, and recovery behavior.
 
+Remote MCP servers use the same server-registered plugin path and outbound URL
+policy. Neo Chat v1 supports only remote `streamable-http` MCP over HTTPS;
+hosted deployments block localhost and private-network MCP targets unless
+`ALLOW_LOCAL_NETWORK_PROXY=true` is explicitly enabled. Hosted or multi-instance
+deployments should configure `PLUGIN_REGISTRY_STORE=upstash` so installed MCP
+tools resolve consistently across instances.
+
 ## Deployment Health
 
 Settings includes a deployment health panel backed by `/api/health`. The route
@@ -169,7 +205,8 @@ to hosted or multi-instance deployments.
 
 `/api/health` intentionally reports availability and policy state only. It must
 not expose access passwords, BYOK key material, provider keys, Upstash tokens,
-or internal Redis URLs.
+or internal Redis URLs. It is a configuration readiness check, not a live canary
+or external uptime monitor.
 
 ## Runtime Recovery
 

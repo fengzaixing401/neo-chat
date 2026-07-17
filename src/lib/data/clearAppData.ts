@@ -1,9 +1,9 @@
 import localforage from "localforage";
-import { RAG_LIMITS } from "../../config/limits";
-import type { Collection, RAGConfig } from "../../types";
+import { RAG_LIMITS } from "@/config/limits";
+import type { Collection, RAGConfig } from "@/types";
 import { buildKnowledgeVectorIds } from "../utils/knowledgeVectors";
-import { appDb, STORAGE_KEYS } from "../../store/storage/storageConfig";
-import { deleteOPFSDirectory } from "../../utils/opfs";
+import { appDb, STORAGE_KEYS } from "@/store/storage/storageConfig";
+import { deleteOPFSDirectory } from "@/utils/opfs";
 import { encryptSecret, fetchWithByokRetry } from "../byok/client";
 import { signedApiFetch } from "../api/client";
 import { BYOK_CONTEXTS } from "../byok/shared";
@@ -16,6 +16,7 @@ import { deleteLocalSecretMasterKey } from "../security/localSecrets";
 
 const APP_OPFS_DIRECTORIES = ["knowledge-base", "workspaces", "images", "chat"];
 const SESSION_MESSAGES_PREFIX = "session_messages_";
+const FONT_SIZE_STORAGE_KEY = "neo-chat-font-size";
 
 export type BrowserAppDataSource =
   | "cache"
@@ -177,6 +178,8 @@ async function clearCacheData(): Promise<void> {
     ...state,
     marketPlugins: [],
     marketPluginsTimestamp: 0,
+    marketMcpServers: [],
+    marketMcpServersTimestamp: 0,
     marketAgents: [],
     marketAgentsTimestamp: 0,
     marketAgentsLocale: "",
@@ -193,6 +196,7 @@ async function clearSettingsAndSecrets(): Promise<void> {
   if (typeof window !== "undefined") {
     window.localStorage.removeItem(STORAGE_KEYS.CORE_SETTINGS);
     window.localStorage.removeItem(STORAGE_KEYS.SETTINGS);
+    window.localStorage.removeItem(FONT_SIZE_STORAGE_KEY);
   }
   await appDb.removeItem(STORAGE_KEYS.SETTINGS);
   await deleteLocalSecretMasterKey();
@@ -274,6 +278,7 @@ async function clearLocalStorageKeys(): Promise<void> {
   window.localStorage.removeItem(STORAGE_KEYS.CHAT);
   window.localStorage.removeItem(STORAGE_KEYS.KNOWLEDGE);
   window.localStorage.removeItem(STORAGE_KEYS.MEMORY);
+  window.localStorage.removeItem(FONT_SIZE_STORAGE_KEY);
   await deleteLocalSecretMasterKey();
 }
 

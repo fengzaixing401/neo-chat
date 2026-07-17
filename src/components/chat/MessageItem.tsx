@@ -8,7 +8,7 @@ import React, {
   useId,
 } from "react";
 import { createPortal } from "react-dom";
-import { useTranslations } from "next-intl";
+import { useLocale, useTranslations } from "next-intl";
 import { toPng } from "html-to-image";
 import type { Attachment, Message } from "@/types";
 import MarkdownRenderer from "../content/MarkdownRenderer";
@@ -16,6 +16,7 @@ import Tooltip from "../ui/Tooltip";
 import Artifact from "../content/Artifact";
 import MessageOutputRenderer from "../content/MessageOutputRenderer";
 import MessageAttachmentView from "./MessageAttachmentView";
+import UserMessageEditor from "./UserMessageEditor";
 import RAGBlock from "../knowledge/RAGBlock";
 import AddToKnowledgeModal from "../knowledge/AddToKnowledgeModal";
 import {
@@ -50,7 +51,6 @@ import {
   Loader2,
   RefreshCw,
   Library,
-  PencilSparkles,
   Sparkles,
   Signature,
   FileImage,
@@ -58,10 +58,8 @@ import {
 import { BubblesLoading } from "../ui/Icons";
 import { useChatStore } from "@/store/core/chatStore";
 import { useUIStore } from "@/store/core/uiStore";
-import { getTaskModel, useSettingsStore } from "@/store/core/settingsStore";
-import { streamGenerateContent } from "@/services/api/chatService";
+import { useSettingsStore } from "@/store/core/settingsStore";
 import { synthesizeSpeech } from "@/services/api/voiceService";
-import { polishTextContent } from "@/services/artifactService";
 import type { DisposableAudioElement } from "@/lib/utils/disposableAudio";
 import { sanitizeDownloadFilename } from "@/lib/utils/filename";
 import {
@@ -69,6 +67,7 @@ import {
   type MarkdownGeneratedFile,
 } from "@/lib/utils/markdownFiles";
 import { copyTextToClipboard } from "@/lib/utils/clipboard";
+import { signedApiFetch } from "@/lib/api/client";
 import { getNextTypewriterFrame } from "@/lib/utils/typewriter";
 import {
   createSpeechSynthesisPoller,
@@ -88,6 +87,7 @@ import {
 
 interface MessageItemProps {
   message: Message;
+  actionsDisabled?: boolean;
   branchInfo?: {
     index: number;
     count: number;
@@ -104,6 +104,7 @@ interface MessageItemProps {
 }
 
 type CopyStatus = "idle" | "copied" | "error";
+type MessageDownloadFormat = "markdown" | "pdf" | "image";
 
 interface ReadableAttachmentDocument {
   name: string;
@@ -134,7 +135,7 @@ const actionButtonFocusClass =
   "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-400/40 focus-visible:ring-offset-2 focus-visible:ring-offset-white dark:focus-visible:ring-offset-background";
 
 const markdownFileNamePattern = /\.(?:md|markdown)$/i;
-const MESSAGE_IMAGE_PROXY_PREFIX = "https://serveproxy.com/?url=";
+const MESSAGE_IMAGE_PROXY_PATH = "/api/media/image-proxy";
 const DEFAULT_MESSAGE_IMAGE_EXPORT_WIDTH = 820;
 const MESSAGE_IMAGE_EXPORT_PADDING_PX = 24;
 const MESSAGE_EXPORT_EXCLUDED_SELECTORS = [
@@ -193,16 +194,15 @@ const getImageExportBackgroundColor = (element: HTMLElement) => {
     : "#ffffff";
 };
 
-const getProxiedMessageExportImageUrl = (src: string) => {
-  if (!src || src.startsWith(MESSAGE_IMAGE_PROXY_PREFIX)) return null;
+const getMessageExportImageSource = (src: string) => {
+  if (!src) return null;
 
   try {
     const url = new URL(src, window.location.href);
     if (url.protocol !== "http:" && url.protocol !== "https:") return null;
     if (url.origin === window.location.origin) return null;
-    if (url.hostname === "serveproxy.com") return null;
 
-    return `${MESSAGE_IMAGE_PROXY_PREFIX}${encodeURIComponent(url.href)}`;
+    return url.href;
   } catch {
     return null;
   }
@@ -238,185 +238,50 @@ const waitForMessageExportImages = async (root: HTMLElement) => {
   await Promise.all(images.map((image) => waitForImageElement(image)));
 };
 
-const proxyMessageExportImages = (root: HTMLElement) => {
-  let didProxy = false;
+const proxyMessageExportImages = async (
+  root: HTMLElement,
+  signal: AbortSignal,
+) => {
+  const objectUrls: string[] = [];
   const images = Array.from(root.querySelectorAll<HTMLImageElement>("img"));
 
-  for (const image of images) {
-    const src =
-      image.currentSrc || image.src || image.getAttribute("src") || "";
-    const proxiedUrl = getProxiedMessageExportImageUrl(src);
-    if (!proxiedUrl) continue;
+  try {
+    for (const image of images) {
+      const src =
+        image.currentSrc || image.src || image.getAttribute("src") || "";
+      const imageSource = getMessageExportImageSource(src);
+      if (!imageSource) continue;
 
-    image.crossOrigin = "anonymous";
-    image.src = proxiedUrl;
-    didProxy = true;
+      const response = await signedApiFetch(MESSAGE_IMAGE_PROXY_PATH, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url: imageSource }),
+        signal,
+      });
+      if (!response.ok) {
+        throw new Error(`Image proxy request failed: ${response.status}`);
+      }
+
+      const objectUrl = URL.createObjectURL(await response.blob());
+      objectUrls.push(objectUrl);
+      image.srcset = "";
+      image.src = objectUrl;
+    }
+  } catch (error) {
+    objectUrls.forEach((objectUrl) => URL.revokeObjectURL(objectUrl));
+    throw error;
   }
 
-  return didProxy;
-};
-
-interface UserMessageEditorProps {
-  initialContent: string;
-  onCancel: () => void;
-  onSubmit: (content: string) => void | Promise<void>;
-}
-
-const UserMessageEditor = ({
-  initialContent,
-  onCancel,
-  onSubmit,
-}: UserMessageEditorProps) => {
-  const t = useTranslations("Message");
-  const [draft, setDraft] = useState(initialContent);
-  const [isSubmitting, setIsSubmitting] = useState(false);
-  const [isPolishing, setIsPolishing] = useState(false);
-  const [polishError, setPolishError] = useState<string | null>(null);
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
-  const mountedRef = useRef(true);
-  const polishRunRef = useRef(0);
-
-  useEffect(() => {
-    mountedRef.current = true;
-    return () => {
-      mountedRef.current = false;
-      polishRunRef.current += 1;
-    };
-  }, []);
-
-  useEffect(() => {
-    const textarea = textareaRef.current;
-    if (!textarea) return;
-    textarea.style.height = "auto";
-    textarea.style.height = `${textarea.scrollHeight}px`;
-  }, [draft]);
-
-  const handlePolish = async () => {
-    const originalText = draft;
-    if (!originalText.trim() || isPolishing || isSubmitting) return;
-
-    const runId = polishRunRef.current + 1;
-    polishRunRef.current = runId;
-    setIsPolishing(true);
-    setPolishError(null);
-
-    try {
-      let replacement = "";
-      await streamGenerateContent(
-        getTaskModel("promptOptimization"),
-        polishTextContent(originalText),
-        (text) => {
-          if (!mountedRef.current || polishRunRef.current !== runId) return;
-          replacement = text;
-          setDraft(text);
-        },
-      );
-
-      if (!mountedRef.current || polishRunRef.current !== runId) return;
-      if (!replacement.trim()) {
-        setDraft(originalText);
-        setPolishError(t("polishUserMessageFailed"));
-      }
-    } catch (error) {
-      logMessageItemError("Failed to polish user message", error);
-      if (mountedRef.current && polishRunRef.current === runId) {
-        setDraft(originalText);
-        setPolishError(t("polishUserMessageFailed"));
-      }
-    } finally {
-      if (mountedRef.current && polishRunRef.current === runId) {
-        setIsPolishing(false);
-      }
-    }
+  return {
+    cleanup: () => {
+      objectUrls.forEach((objectUrl) => URL.revokeObjectURL(objectUrl));
+    },
   };
-
-  const handleSubmit = async () => {
-    if (!draft.trim() || isSubmitting || isPolishing) return;
-    if (draft === initialContent) {
-      onCancel();
-      return;
-    }
-
-    setIsSubmitting(true);
-    try {
-      await onSubmit(draft);
-    } finally {
-      if (mountedRef.current) {
-        setIsSubmitting(false);
-      }
-    }
-  };
-
-  return (
-    <div className="rounded-lg border border-input bg-background shadow-sm focus-within:ring-2 focus-within:ring-ring focus-within:ring-offset-2 focus-within:ring-offset-background">
-      <textarea
-        ref={textareaRef}
-        value={draft}
-        onChange={(event) => {
-          setDraft(event.target.value);
-          setPolishError(null);
-        }}
-        className="max-h-72 min-h-28 w-full resize-none bg-transparent px-3 py-3 text-sm leading-6 text-foreground outline-none placeholder:text-muted-foreground focus-visible:ring-ring"
-        aria-label={t("editUserMessageAria")}
-        autoFocus
-      />
-      {polishError ? (
-        <div className="px-3 pb-2 text-xs text-red-600 dark:text-red-300">
-          {polishError}
-        </div>
-      ) : null}
-      <div className="flex items-center justify-between gap-3 border-t border-border/70 px-2 py-2">
-        <Tooltip
-          content={
-            isPolishing ? t("polishingUserMessage") : t("polishUserMessage")
-          }
-          position="top"
-        >
-          <button
-            type="button"
-            aria-label={t("polishUserMessageAria")}
-            aria-busy={isPolishing || undefined}
-            onClick={handlePolish}
-            disabled={!draft.trim() || isPolishing || isSubmitting}
-            className={`inline-flex h-8 items-center justify-center gap-1.5 rounded-lg border border-transparent px-2 text-xs font-medium text-gray-600 transition-[background-color,border-color,color,opacity] hover:border-white/40 hover:bg-gray-100 hover:text-gray-900 disabled:cursor-not-allowed disabled:opacity-40 dark:text-foreground/85 dark:hover:border-border dark:hover:bg-accent dark:hover:text-foreground ${actionButtonFocusClass}`}
-          >
-            {isPolishing ? (
-              <Loader2 size={14} className="animate-spin" aria-hidden="true" />
-            ) : (
-              <PencilSparkles size={14} aria-hidden="true" />
-            )}
-            <span>{t("polishUserMessageShort")}</span>
-          </button>
-        </Tooltip>
-
-        <div className="flex items-center gap-2">
-          <button
-            type="button"
-            onClick={onCancel}
-            disabled={isSubmitting}
-            className={`rounded-lg px-3 py-1.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50 ${actionButtonFocusClass}`}
-          >
-            {t("cancelEdit")}
-          </button>
-          <button
-            type="button"
-            onClick={handleSubmit}
-            disabled={!draft.trim() || isSubmitting || isPolishing}
-            className={`inline-flex items-center gap-1.5 rounded-lg bg-foreground px-3 py-1.5 text-xs font-medium text-background transition-colors hover:bg-foreground/90 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-foreground dark:text-background ${actionButtonFocusClass}`}
-          >
-            {isSubmitting ? (
-              <Loader2 size={13} className="animate-spin" aria-hidden="true" />
-            ) : null}
-            {t("sendEdit")}
-          </button>
-        </div>
-      </div>
-    </div>
-  );
 };
 
 const MessageItem: React.FC<MessageItemProps> = ({
   message,
+  actionsDisabled = false,
   branchInfo,
   onEdit,
   onDelete,
@@ -428,6 +293,18 @@ const MessageItem: React.FC<MessageItemProps> = ({
   isTyping = false,
 }) => {
   const t = useTranslations("Message");
+  const locale = useLocale();
+  const durationFormatter = useMemo(
+    () =>
+      new Intl.NumberFormat(locale, {
+        style: "unit",
+        unit: "second",
+        unitDisplay: "short",
+        minimumFractionDigits: 1,
+        maximumFractionDigits: 1,
+      }),
+    [locale],
+  );
   const [isEditing, setIsEditing] = useState(false);
   const [copyStatus, setCopyStatus] = useState<CopyStatus>("idle");
   const [readerCopyStatus, setReaderCopyStatus] = useState<CopyStatus>("idle");
@@ -447,6 +324,8 @@ const MessageItem: React.FC<MessageItemProps> = ({
   const [imageExportJob, setImageExportJob] = useState<ImageExportJob | null>(
     null,
   );
+  const [downloadingFormat, setDownloadingFormat] =
+    useState<MessageDownloadFormat | null>(null);
   const [imageExportError, setImageExportError] = useState<string | null>(null);
 
   // Immersive / Reading Mode State
@@ -482,6 +361,8 @@ const MessageItem: React.FC<MessageItemProps> = ({
   const readingDialogRef = useRef<HTMLDivElement>(null);
   const imageExportRootRef = useRef<HTMLDivElement>(null);
   const visibleMessageContentRef = useRef<HTMLDivElement>(null);
+  const downloadLockRef = useRef<MessageDownloadFormat | null>(null);
+  const downloadResetTimerRef = useRef<number | null>(null);
   const readingRestoreFocusRef = useRef<HTMLElement | null>(null);
   const readingDialogTitleId = useId();
   const readingDialogDescriptionId = useId();
@@ -492,6 +373,21 @@ const MessageItem: React.FC<MessageItemProps> = ({
     useChatStore();
   const { openImagePreview } = useUIStore();
   const { voice } = useSettingsStore();
+
+  const beginDownload = useCallback((format: MessageDownloadFormat) => {
+    if (downloadLockRef.current) return false;
+    downloadLockRef.current = format;
+    setDownloadingFormat(format);
+    return true;
+  }, []);
+
+  const finishDownload = useCallback((format: MessageDownloadFormat) => {
+    if (downloadLockRef.current !== format) return;
+    downloadLockRef.current = null;
+    setDownloadingFormat(null);
+  }, []);
+
+  const isDownloading = downloadingFormat !== null;
 
   const stopCurrentAudio = () => {
     currentAudioRef.current?.dispose();
@@ -542,6 +438,7 @@ const MessageItem: React.FC<MessageItemProps> = ({
   };
 
   const handleDeleteClick = () => {
+    if (actionsDisabled) return;
     if (isDeleteConfirming) {
       resetDeleteConfirmation();
       setShowMoreMenu(false);
@@ -612,6 +509,11 @@ const MessageItem: React.FC<MessageItemProps> = ({
       copyStatusResetRef.current?.dispose();
       readerCopyStatusResetRef.current?.dispose();
       clearDeleteConfirmTimer();
+      if (downloadResetTimerRef.current !== null) {
+        window.clearTimeout(downloadResetTimerRef.current);
+        downloadResetTimerRef.current = null;
+      }
+      downloadLockRef.current = null;
       stopCurrentAudio();
       // Also stop browser synthesis if running
       if (window.speechSynthesis) {
@@ -656,6 +558,7 @@ const MessageItem: React.FC<MessageItemProps> = ({
         cleanupTimer = null;
       }
       restoreDocumentTitle();
+      finishDownload("pdf");
       setPdfPrintJob((current) =>
         current?.id === pdfPrintJob.id ? null : current,
       );
@@ -678,9 +581,10 @@ const MessageItem: React.FC<MessageItemProps> = ({
       if (!cleanedUp) {
         cleanedUp = true;
         restoreDocumentTitle();
+        finishDownload("pdf");
       }
     };
-  }, [pdfPrintJob]);
+  }, [finishDownload, pdfPrintJob]);
 
   useEffect(() => {
     if (!imageExportJob) return;
@@ -688,6 +592,8 @@ const MessageItem: React.FC<MessageItemProps> = ({
     let firstFrame: number | null = null;
     let secondFrame: number | null = null;
     let cancelled = false;
+    const proxyController = new AbortController();
+    let cleanupProxiedImages = () => {};
 
     const downloadImageDataUrl = (dataUrl: string) => {
       const a = document.createElement("a");
@@ -699,6 +605,7 @@ const MessageItem: React.FC<MessageItemProps> = ({
     };
 
     const cleanupImageExportJob = () => {
+      finishDownload("image");
       setImageExportJob((current) =>
         current?.id === imageExportJob.id ? null : current,
       );
@@ -707,7 +614,7 @@ const MessageItem: React.FC<MessageItemProps> = ({
     const exportRootToPng = async (root: HTMLElement) => {
       const backgroundColor = getImageExportBackgroundColor(root);
       return toPng(root, {
-        cacheBust: true,
+        cacheBust: false,
         backgroundColor,
         width: imageExportJob.width,
         canvasWidth: imageExportJob.width,
@@ -726,30 +633,21 @@ const MessageItem: React.FC<MessageItemProps> = ({
       }
 
       try {
+        const proxyResult = await proxyMessageExportImages(
+          root,
+          proxyController.signal,
+        );
+        cleanupProxiedImages = proxyResult.cleanup;
         await waitForMessageExportImages(root);
         const dataUrl = await exportRootToPng(root);
         if (!cancelled) downloadImageDataUrl(dataUrl);
-      } catch (firstError) {
-        if (cancelled) return;
-
-        const didProxy = proxyMessageExportImages(root);
-        if (!didProxy) {
-          logMessageItemError("Failed to export message image", firstError);
+      } catch (error) {
+        if (!cancelled) {
+          logMessageItemError("Failed to export message image", error);
           setImageExportError(t("downloadImageFailed"));
-          return;
-        }
-
-        try {
-          await waitForMessageExportImages(root);
-          const dataUrl = await exportRootToPng(root);
-          if (!cancelled) downloadImageDataUrl(dataUrl);
-        } catch (retryError) {
-          if (!cancelled) {
-            logMessageItemError("Failed to export message image", retryError);
-            setImageExportError(t("downloadImageFailed"));
-          }
         }
       } finally {
+        cleanupProxiedImages();
         if (!cancelled) cleanupImageExportJob();
       }
     };
@@ -762,10 +660,12 @@ const MessageItem: React.FC<MessageItemProps> = ({
 
     return () => {
       cancelled = true;
+      proxyController.abort();
+      finishDownload("image");
       if (firstFrame !== null) cancelAnimationFrame(firstFrame);
       if (secondFrame !== null) cancelAnimationFrame(secondFrame);
     };
-  }, [imageExportJob, t]);
+  }, [finishDownload, imageExportJob, t]);
 
   // Typewriter Effect Logic using requestAnimationFrame
   useEffect(() => {
@@ -814,6 +714,7 @@ const MessageItem: React.FC<MessageItemProps> = ({
   };
 
   const handleEditClick = () => {
+    if (actionsDisabled) return;
     setIsEditing(true);
   };
 
@@ -846,19 +747,32 @@ const MessageItem: React.FC<MessageItemProps> = ({
     );
 
   const handleDownloadMarkdown = () => {
-    const blob = new Blob([message.content], { type: "text/markdown" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = getMessageDownloadName("md");
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-    setShowMoreMenu(false);
+    if (!beginDownload("markdown")) return;
+
+    try {
+      const blob = new Blob([message.content], { type: "text/markdown" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = getMessageDownloadName("md");
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    } finally {
+      setShowMoreMenu(false);
+      if (downloadResetTimerRef.current !== null) {
+        window.clearTimeout(downloadResetTimerRef.current);
+      }
+      downloadResetTimerRef.current = window.setTimeout(() => {
+        downloadResetTimerRef.current = null;
+        finishDownload("markdown");
+      }, 250);
+    }
   };
 
   const handleDownloadPdf = () => {
+    if (!beginDownload("pdf")) return;
     setPdfPrintJob({
       id: `${message.id}-${Date.now()}`,
       title: getMessageDownloadName("pdf"),
@@ -869,6 +783,7 @@ const MessageItem: React.FC<MessageItemProps> = ({
   };
 
   const handleDownloadImage = () => {
+    if (!beginDownload("image")) return;
     setImageExportError(null);
     setImageExportJob({
       id: `${message.id}-${Date.now()}`,
@@ -1046,7 +961,10 @@ const MessageItem: React.FC<MessageItemProps> = ({
   const currentBranchIndex = branchInfo?.index ?? 0;
   const branchCount = branchInfo?.count ?? 1;
   const canEditCurrentUserMessage =
-    message.role === "user" && canEditUserMessage && !!onSubmitUserEdit;
+    !actionsDisabled &&
+    message.role === "user" &&
+    canEditUserMessage &&
+    !!onSubmitUserEdit;
 
   // --- Display Info Calculation ---
   const displayTimestamp = message.timestamp;
@@ -1072,16 +990,16 @@ const MessageItem: React.FC<MessageItemProps> = ({
       message.role === "model" && displayTiming?.endTime
         ? displayTiming.endTime
         : displayTimestamp;
-    return new Date(ts).toLocaleTimeString([], {
+    return new Intl.DateTimeFormat(locale, {
       hour: "2-digit",
       minute: "2-digit",
       second: "2-digit",
-    });
+    }).format(new Date(ts));
   };
 
   const getDurationString = () => {
     if (message.role === "model" && displayTiming?.duration) {
-      return `${(displayTiming.duration / 1000).toFixed(1)}s`;
+      return durationFormatter.format(displayTiming.duration / 1000);
     }
     return null;
   };
@@ -1104,6 +1022,7 @@ const MessageItem: React.FC<MessageItemProps> = ({
 
   // RAG Data
   const ragSources = message.ragSources || [];
+  const ragError = message.ragError?.message;
 
   // Tool Data
   const skillInvocations = message.skillInvocations || [];
@@ -1265,6 +1184,8 @@ const MessageItem: React.FC<MessageItemProps> = ({
                   displayedContent={imageExportJob.message.content}
                   searchSources={imageExportJob.searchSources}
                   forceExpandCodeBlocks
+                  hideReasoning
+                  hideToolCalls
                 />
               </div>
             </div>
@@ -1485,7 +1406,7 @@ const MessageItem: React.FC<MessageItemProps> = ({
           ) : (
             <>
               {/* RAG Block Component */}
-              <RAGBlock sources={ragSources} />
+              <RAGBlock sources={ragSources} error={ragError} />
 
               {skillInvocations.length > 0 && (
                 <div className="mb-3 flex flex-wrap gap-1.5">
@@ -1647,7 +1568,7 @@ const MessageItem: React.FC<MessageItemProps> = ({
                         icon={<ChevronLeft size={13} />}
                         tooltip={t("previousVersion")}
                         onClick={() => onVersionChange(message.id, "prev")}
-                        disabled={currentBranchIndex === 0}
+                        disabled={actionsDisabled || currentBranchIndex === 0}
                         className={
                           currentBranchIndex === 0
                             ? "opacity-30 cursor-not-allowed"
@@ -1661,7 +1582,10 @@ const MessageItem: React.FC<MessageItemProps> = ({
                         icon={<ChevronRight size={13} />}
                         tooltip={t("nextVersion")}
                         onClick={() => onVersionChange(message.id, "next")}
-                        disabled={currentBranchIndex === branchCount - 1}
+                        disabled={
+                          actionsDisabled ||
+                          currentBranchIndex === branchCount - 1
+                        }
                         className={
                           currentBranchIndex === branchCount - 1
                             ? "opacity-30 cursor-not-allowed"
@@ -1680,6 +1604,7 @@ const MessageItem: React.FC<MessageItemProps> = ({
                         icon={<Undo2 size={13} />}
                         tooltip={t("retract")}
                         onClick={onRetract}
+                        disabled={actionsDisabled}
                       />
                     )}
                     {canEditCurrentUserMessage && (
@@ -1726,11 +1651,13 @@ const MessageItem: React.FC<MessageItemProps> = ({
                       icon={<RefreshCw size={13} />}
                       tooltip={t("regenerate")}
                       onClick={onRegenerate}
+                      disabled={actionsDisabled}
                     />
                     <ActionButton
                       icon={<Edit2 size={13} />}
                       tooltip={t("edit")}
                       onClick={handleEditClick}
+                      disabled={actionsDisabled}
                       containerClass="hidden! md:flex!"
                     />
                     <ActionButton
@@ -1779,19 +1706,43 @@ const MessageItem: React.FC<MessageItemProps> = ({
                     />
                     <div className="hidden! md:flex!">
                       <DropdownMenu>
-                        <Tooltip content={t("download")} position="top">
+                        <Tooltip
+                          content={
+                            isDownloading
+                              ? t("downloadInProgress")
+                              : t("download")
+                          }
+                          position="top"
+                        >
                           <DropdownMenuTrigger asChild>
                             <button
                               type="button"
-                              aria-label={t("downloadFormat")}
+                              aria-label={
+                                isDownloading
+                                  ? t("downloadInProgress")
+                                  : t("downloadFormat")
+                              }
+                              aria-busy={isDownloading}
+                              disabled={isDownloading}
                               className={`p-1.5 rounded-lg hover:bg-gray-100 dark:hover:bg-muted hover:text-gray-700 dark:hover:text-foreground/85 transition-[background-color,border-color,color,opacity] relative group/btn border border-transparent hover:border-white/50 dark:hover:border-border flex items-center justify-center ${actionButtonFocusClass}`}
                             >
-                              <Download size={13} aria-hidden="true" />
+                              {isDownloading ? (
+                                <Loader2
+                                  size={13}
+                                  className="animate-spin"
+                                  aria-hidden="true"
+                                />
+                              ) : (
+                                <Download size={13} aria-hidden="true" />
+                              )}
                             </button>
                           </DropdownMenuTrigger>
                         </Tooltip>
                         <DropdownMenuContent side="top" align="end">
-                          <DropdownMenuItem onSelect={handleDownloadMarkdown}>
+                          <DropdownMenuItem
+                            disabled={isDownloading}
+                            onSelect={handleDownloadMarkdown}
+                          >
                             <FileText
                               size={14}
                               className="text-gray-500 dark:text-muted-foreground"
@@ -1799,7 +1750,10 @@ const MessageItem: React.FC<MessageItemProps> = ({
                             />
                             <span>{t("downloadMarkdown")}</span>
                           </DropdownMenuItem>
-                          <DropdownMenuItem onSelect={handleDownloadPdf}>
+                          <DropdownMenuItem
+                            disabled={isDownloading}
+                            onSelect={handleDownloadPdf}
+                          >
                             <Signature
                               size={14}
                               className="text-gray-500 dark:text-muted-foreground"
@@ -1807,7 +1761,10 @@ const MessageItem: React.FC<MessageItemProps> = ({
                             />
                             <span>{t("downloadPdf")}</span>
                           </DropdownMenuItem>
-                          <DropdownMenuItem onSelect={handleDownloadImage}>
+                          <DropdownMenuItem
+                            disabled={isDownloading}
+                            onSelect={handleDownloadImage}
+                          >
                             <FileImage
                               size={14}
                               className="text-gray-500 dark:text-muted-foreground"
@@ -1833,6 +1790,7 @@ const MessageItem: React.FC<MessageItemProps> = ({
                     isDeleteConfirming ? t("confirmDelete") : t("delete")
                   }
                   onClick={handleDeleteClick}
+                  disabled={actionsDisabled}
                   containerClass={
                     message.role === "user" ? "flex" : "hidden! md:flex!"
                   }
@@ -1852,18 +1810,33 @@ const MessageItem: React.FC<MessageItemProps> = ({
                         setShowMoreMenu(open);
                       }}
                     >
-                      <Tooltip content={t("more")} position="top">
+                      <Tooltip
+                        content={
+                          isDownloading ? t("downloadInProgress") : t("more")
+                        }
+                        position="top"
+                      >
                         <DropdownMenuTrigger asChild>
                           <button
                             type="button"
                             aria-label={t("more")}
+                            aria-busy={isDownloading}
+                            disabled={isDownloading}
                             className={`p-1.5 rounded-lg hover:bg-gray-100 dark:hover:bg-muted hover:text-gray-700 dark:hover:text-foreground/85 transition-[background-color,border-color,color,opacity] relative group/btn border border-transparent hover:border-white/50 dark:hover:border-border flex items-center justify-center ${actionButtonFocusClass} ${
                               showMoreMenu
                                 ? "bg-gray-100 dark:bg-muted text-gray-700 dark:text-foreground/85"
                                 : ""
                             }`}
                           >
-                            <MoreHorizontal size={13} aria-hidden="true" />
+                            {isDownloading ? (
+                              <Loader2
+                                size={13}
+                                className="animate-spin"
+                                aria-hidden="true"
+                              />
+                            ) : (
+                              <MoreHorizontal size={13} aria-hidden="true" />
+                            )}
                           </button>
                         </DropdownMenuTrigger>
                       </Tooltip>
@@ -1874,6 +1847,7 @@ const MessageItem: React.FC<MessageItemProps> = ({
                         className="w-48"
                       >
                         <DropdownMenuItem
+                          disabled={actionsDisabled}
                           onSelect={() => {
                             handleEditClick();
                             setShowMoreMenu(false);
@@ -1897,16 +1871,31 @@ const MessageItem: React.FC<MessageItemProps> = ({
                         </DropdownMenuItem>
 
                         <DropdownMenuSub>
-                          <DropdownMenuSubTrigger>
-                            <Download
-                              size={14}
-                              className="text-gray-500 dark:text-muted-foreground"
-                              aria-hidden="true"
-                            />
-                            <span>{t("download")}</span>
+                          <DropdownMenuSubTrigger disabled={isDownloading}>
+                            {isDownloading ? (
+                              <Loader2
+                                size={14}
+                                className="animate-spin text-gray-500 dark:text-muted-foreground"
+                                aria-hidden="true"
+                              />
+                            ) : (
+                              <Download
+                                size={14}
+                                className="text-gray-500 dark:text-muted-foreground"
+                                aria-hidden="true"
+                              />
+                            )}
+                            <span>
+                              {isDownloading
+                                ? t("downloadInProgress")
+                                : t("download")}
+                            </span>
                           </DropdownMenuSubTrigger>
                           <DropdownMenuSubContent>
-                            <DropdownMenuItem onSelect={handleDownloadMarkdown}>
+                            <DropdownMenuItem
+                              disabled={isDownloading}
+                              onSelect={handleDownloadMarkdown}
+                            >
                               <FileText
                                 size={14}
                                 className="text-gray-500 dark:text-muted-foreground"
@@ -1914,7 +1903,10 @@ const MessageItem: React.FC<MessageItemProps> = ({
                               />
                               <span>{t("downloadMarkdown")}</span>
                             </DropdownMenuItem>
-                            <DropdownMenuItem onSelect={handleDownloadPdf}>
+                            <DropdownMenuItem
+                              disabled={isDownloading}
+                              onSelect={handleDownloadPdf}
+                            >
                               <Signature
                                 size={14}
                                 className="text-gray-500 dark:text-muted-foreground"
@@ -1922,7 +1914,10 @@ const MessageItem: React.FC<MessageItemProps> = ({
                               />
                               <span>{t("downloadPdf")}</span>
                             </DropdownMenuItem>
-                            <DropdownMenuItem onSelect={handleDownloadImage}>
+                            <DropdownMenuItem
+                              disabled={isDownloading}
+                              onSelect={handleDownloadImage}
+                            >
                               <FileImage
                                 size={14}
                                 className="text-gray-500 dark:text-muted-foreground"
@@ -1936,6 +1931,7 @@ const MessageItem: React.FC<MessageItemProps> = ({
                         <DropdownMenuSeparator />
                         <DropdownMenuItem
                           variant="destructive"
+                          disabled={actionsDisabled}
                           onSelect={(event) => {
                             event.preventDefault();
                             handleDeleteClick();

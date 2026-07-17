@@ -2,11 +2,8 @@ import {
   Message,
   Attachment,
   ChatConfig,
-  ImageSource,
-  ModelMetadata,
   Session,
   MessageOutputBlock,
-  Source,
   ToolCall,
 } from "@/types";
 import { useSettingsStore, getTaskModel } from "@/store/core/settingsStore";
@@ -14,344 +11,165 @@ import { useCoreSettingsStore } from "@/store/core/coreSettingsStore";
 import { useMemoryStore } from "@/store/core/memoryStore";
 import { v7 as uuidv7 } from "uuid";
 import { executePluginFunction } from "@/utils/pluginUtils";
-import { createSearchProvider } from "./searchService";
 import { getEnabledPluginFunctions } from "@/lib/plugin/resolve";
 import {
   parseModelString,
   supportsImageGeneration,
   supportsTextOutput,
 } from "@/lib/utils/model";
-import { isOpenAIProviderType } from "../../lib/providers/providerTypes";
+import {
+  isGoogleProviderType,
+  isOpenAIProviderType,
+} from "@/lib/providers/providerTypes";
 import { normalizeSessionTitle } from "@/lib/chat/entities";
 import { appendContextToChatInput } from "@/lib/utils/chatInput";
-import { cacheGeneratedImageAttachments } from "../../lib/utils/generatedImages";
+import { cacheGeneratedImageAttachments } from "@/lib/utils/generatedImages";
 import {
   stripAttachmentsDisplayCacheForModel,
   stripMessagesDisplayCacheForModel,
-} from "../../lib/utils/imageDisplayCache";
-import { appendDiagramRequestInstructions } from "../../lib/chat/diagramPrompt";
-import { appendHtmlVisualRequestInstructions } from "../../lib/chat/htmlVisualPrompt";
+} from "@/lib/utils/imageDisplayCache";
+import { appendDiagramRequestInstructions } from "@/lib/chat/diagramPrompt";
+import { appendHtmlVisualRequestInstructions } from "@/lib/chat/htmlVisualPrompt";
 import {
   getSearchCompatibility,
   getSearchCompatibilityErrorMessage,
 } from "@/lib/settings/searchRag";
-import { createMessageOutputBlockBuilder } from "../../lib/chat/messageOutputBlocks";
-import { resolveImageGenerationOptions } from "../../lib/chat/imageGenerationOptions";
+import { createMessageOutputBlockBuilder } from "@/lib/chat/messageOutputBlocks";
+import { resolveImageGenerationOptions } from "@/lib/chat/imageGenerationOptions";
 import {
-  buildSearchContextForPrompt,
-  createSearchDecisionPrompt,
-  parseSearchDecisionResult,
-  type SearchDecision,
-} from "../../lib/search/decision";
-import {
+  buildCompressionSource,
   createContextCompressionSummaryPrompt,
-  mergeCompressedContent,
+  mergeCompressedContentWithMemoryIds,
   normalizeCompressedContent,
+  normalizeCompressedContentWithMemoryIds,
   textToBase64,
 } from "@/lib/utils/contextCompression";
 import {
   getResponseErrorMessage,
   readJsonResponseOrThrow,
   signedApiFetch,
-} from "../../lib/api/client";
+} from "@/lib/api/client";
 import {
   buildProviderRuntimeConfig,
   fetchWithByokRetry,
-} from "../../lib/byok/client";
-import {
-  allocateContextBudget,
-  trimTextToEstimatedTokens,
-} from "../../lib/chat/contextBudget";
+} from "@/lib/byok/client";
 import {
   parseMemoryDreamToolCall,
   parseMemoryRecordToolCall,
-  searchMemoryRecords,
-  shouldExposeMemorySearchTool,
-} from "../../lib/memory/entities";
+} from "@/lib/memory/entities";
 import {
   createMemoryDreamPrompt,
   createMemoryExtractionPrompt,
-  formatMemoryToolResult,
   MEMORY_DREAM_TOOL,
   MEMORY_DREAM_TOOL_NAME,
   MEMORY_RECORD_TOOL,
   MEMORY_RECORD_TOOL_NAME,
-  MEMORY_SEARCH_TOOL,
-  MEMORY_SEARCH_TOOL_NAME,
-} from "../../lib/memory/tools";
-import { logDevError, logDevWarn } from "../../lib/utils/devLogger";
-import { MEMORY_LIMITS, PLUGIN_EXECUTION_LIMITS } from "../../config/limits";
+} from "@/lib/memory/tools";
+import { logDevError, logDevWarn } from "@/lib/utils/devLogger";
+import { MEMORY_LIMITS, PLUGIN_EXECUTION_LIMITS } from "@/config/limits";
+import {
+  addInternalMemoryTools,
+  executeMemorySearchTool,
+  isBrowserMemoryStorePendingHydration,
+  isInternalMemoryTool,
+} from "./chat/memoryTools";
+import {
+  runExternalSearchPreflight,
+  type SearchStatusResults,
+} from "./chat/externalSearchPreflight";
+import { resolveModelMetadata } from "./chat/modelSelection";
+import { compactPluginImageResultForHistory } from "./chat/pluginImageResults";
+import type { ChatToolDefinition } from "./chat/types";
+import { mapWithConcurrency } from "@/lib/utils/concurrency";
+import { boundHistoryForRequest } from "@/lib/chat/requestContextBudget";
 
-type SearchStatusResults = { sources: Source[]; images: ImageSource[] };
 type ChatUsagePayload = { usage?: unknown; usageMetadata?: unknown };
-type ChatToolDefinition = {
-  type: "function";
-  function: {
-    name: string;
-    description?: string;
-    parameters?: unknown;
-  };
+
+export class IncompleteChatStreamError extends Error {
+  readonly code = "INCOMPLETE_CHAT_STREAM";
+  readonly recoverable = true;
+
+  constructor() {
+    super("The response stream ended before completion. Please retry.");
+    this.name = "IncompleteChatStreamError";
+  }
+}
+
+export class ChatStreamEventError extends Error {
+  constructor(
+    message: string,
+    readonly code = "CHAT_STREAM_ERROR",
+  ) {
+    super(message);
+    this.name = "ChatStreamEventError";
+  }
+}
+
+export class ChatStreamTimeoutError extends ChatStreamEventError {
+  constructor(message: string) {
+    super(message, "RESPONSE_TIMEOUT");
+    this.name = "ChatStreamTimeoutError";
+  }
+}
+
+export class ChatStreamSizeLimitError extends ChatStreamEventError {
+  constructor(message: string) {
+    super(message, "RESPONSE_SIZE_LIMIT");
+    this.name = "ChatStreamSizeLimitError";
+  }
+}
+
+type ChatStreamRoundPayload = {
+  content: string;
+  reasoning: string;
+  toolCalls: ToolCall[];
 };
 
-type PluginImageCandidate = {
-  id?: unknown;
-  mimeType?: unknown;
-  data?: unknown;
-  url?: unknown;
-  fileName?: unknown;
-};
+type ChatStreamRoundResult =
+  | (ChatStreamRoundPayload & { status: "done" })
+  | (ChatStreamRoundPayload & { status: "aborted"; error: Error })
+  | (ChatStreamRoundPayload & { status: "error"; error: Error })
+  | (ChatStreamRoundPayload & {
+      status: "incomplete";
+      error: IncompleteChatStreamError;
+    });
+
+function isAbortError(error: unknown, signal?: AbortSignal): boolean {
+  return (
+    signal?.aborted === true ||
+    (error instanceof Error && error.name === "AbortError")
+  );
+}
+
+function createAbortError(signal?: AbortSignal): Error {
+  if (signal?.reason instanceof Error) return signal.reason;
+  if (typeof DOMException !== "undefined") {
+    return new DOMException("The operation was aborted", "AbortError");
+  }
+  const error = new Error("The operation was aborted");
+  error.name = "AbortError";
+  return error;
+}
+
+function createChatStreamEventError(event: {
+  error?: string;
+  code?: string;
+}): ChatStreamEventError {
+  const message = event.error || "The response stream failed.";
+  if (event.code === "INCOMPLETE_PROVIDER_STREAM") {
+    return new IncompleteChatStreamError();
+  }
+  if (event.code === "RESPONSE_TIMEOUT") {
+    return new ChatStreamTimeoutError(message);
+  }
+  if (event.code === "RESPONSE_SIZE_LIMIT") {
+    return new ChatStreamSizeLimitError(message);
+  }
+  return new ChatStreamEventError(message, event.code);
+}
 
 function coerceToolDefinition(tool: unknown): ChatToolDefinition {
   return tool as ChatToolDefinition;
-}
-
-function isBrowserMemoryStorePendingHydration(hasHydrated: boolean): boolean {
-  return typeof window !== "undefined" && !hasHydrated;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return Boolean(value && typeof value === "object" && !Array.isArray(value));
-}
-
-function isMemorySearchEnabled(): boolean {
-  const { _hasHydrated, settings } = useMemoryStore.getState();
-  return Boolean(
-    !isBrowserMemoryStorePendingHydration(_hasHydrated) &&
-    settings.enabled &&
-    settings.searchEnabled,
-  );
-}
-
-function addInternalMemoryTools(
-  tools: ChatToolDefinition[],
-  toolNames: Set<string>,
-  message: string,
-): void {
-  if (!isMemorySearchEnabled()) return;
-  if (!shouldExposeMemorySearchTool(message)) return;
-  tools.push(coerceToolDefinition(MEMORY_SEARCH_TOOL));
-  toolNames.add(MEMORY_SEARCH_TOOL_NAME);
-}
-
-function isInternalMemoryTool(name: string | undefined): boolean {
-  return name === MEMORY_SEARCH_TOOL_NAME;
-}
-
-function getNumberArg(value: unknown, fallback: number): number {
-  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
-}
-
-async function executeMemorySearchTool(args: unknown): Promise<unknown> {
-  const state = useMemoryStore.getState();
-  const { _hasHydrated, settings, memories } = state;
-  if (
-    isBrowserMemoryStorePendingHydration(_hasHydrated) ||
-    !settings.enabled ||
-    !settings.searchEnabled
-  ) {
-    return { memories: [] };
-  }
-
-  const input =
-    args && typeof args === "object" && !Array.isArray(args)
-      ? (args as Record<string, unknown>)
-      : {};
-  const query =
-    typeof input.query === "string" && input.query.trim() ? input.query : "";
-  const limit = getNumberArg(input.limit, MEMORY_LIMITS.defaultSearchResults);
-  const results = searchMemoryRecords(memories, query, limit);
-  state.markMemoriesUsed(results.map((memory) => memory.id));
-  return formatMemoryToolResult(results);
-}
-
-function parsePluginImageBase64(
-  value: unknown,
-  fallbackMimeType: unknown,
-): { data: string; mimeType: string } | null {
-  if (typeof value !== "string" || !value.trim()) return null;
-
-  const raw = value.trim();
-  const dataUrlMatch = raw.match(/^data:([^;,]+)?;base64,(.*)$/);
-  if (dataUrlMatch) {
-    return {
-      mimeType: dataUrlMatch[1] || "image/png",
-      data: dataUrlMatch[2] || "",
-    };
-  }
-
-  return {
-    mimeType:
-      typeof fallbackMimeType === "string" ? fallbackMimeType : "image/png",
-    data: raw,
-  };
-}
-
-function getPluginResultImageCandidates(
-  resultData: unknown,
-): PluginImageCandidate[] {
-  if (!isRecord(resultData)) return [];
-
-  const nestedImageRecords = Array.isArray(resultData.images)
-    ? resultData.images.filter(isRecord)
-    : [];
-  const imageRecords =
-    nestedImageRecords.length > 0 ? nestedImageRecords : [resultData];
-
-  return imageRecords
-    .map((item, index): PluginImageCandidate | null => {
-      const parsedBase64 = parsePluginImageBase64(
-        item.imageBase64,
-        item.mimeType,
-      );
-      const imageUrl =
-        typeof item.imageUrl === "string" && item.imageUrl.trim()
-          ? item.imageUrl.trim()
-          : "";
-      if (!parsedBase64 && !imageUrl) return null;
-
-      return {
-        id: item.id,
-        mimeType: parsedBase64?.mimeType || item.mimeType || "image/png",
-        data: parsedBase64?.data,
-        url: parsedBase64 ? undefined : imageUrl,
-        fileName:
-          typeof item.fileName === "string" && item.fileName.trim()
-            ? item.fileName
-            : imageRecords.length > 1
-              ? `plugin-image-${index + 1}.png`
-              : "plugin-image.png",
-      };
-    })
-    .filter((item): item is PluginImageCandidate => Boolean(item));
-}
-
-function compactPluginImageResultForHistory(resultData: unknown): unknown {
-  if (!isRecord(resultData)) return resultData;
-
-  const imageCandidates = getPluginResultImageCandidates(resultData);
-  if (imageCandidates.length === 0) return resultData;
-
-  const compacted = Object.fromEntries(
-    Object.entries(resultData).filter(
-      ([key]) => !["imageBase64", "imageUrl", "images", "raw"].includes(key),
-    ),
-  );
-  const firstUrl = imageCandidates.find(
-    (image) => typeof image.url === "string" && image.url.trim(),
-  )?.url;
-  const hasInlineImage = imageCandidates.some(
-    (image) => typeof image.data === "string" && image.data.trim(),
-  );
-
-  return {
-    ...compacted,
-    imageUrl: typeof firstUrl === "string" ? firstUrl : null,
-    imageBase64: hasInlineImage ? "[image omitted]" : null,
-    imageCount: imageCandidates.length,
-  };
-}
-
-function resolveModelMetadata(modelName: string): ModelMetadata | undefined {
-  const { modelMetadata, customModelMetadata } = useSettingsStore.getState();
-  return customModelMetadata?.[modelName] || modelMetadata?.[modelName];
-}
-
-function getMessagesContextLength(messages: Message[]): number {
-  return messages.reduce((sum, message) => {
-    const attachmentLength =
-      message.attachments?.reduce(
-        (attachmentSum, attachment) =>
-          attachmentSum +
-          (attachment.fileName?.length || 0) +
-          (attachment.data?.length || 0) +
-          (attachment.url?.length || 0),
-        0,
-      ) || 0;
-
-    return (
-      sum +
-      message.content.length +
-      (message.reasoning?.length || 0) +
-      attachmentLength
-    );
-  }, 0);
-}
-
-function getAttachmentsContextLength(attachments: Attachment[]): number {
-  return attachments.reduce(
-    (sum, attachment) =>
-      sum +
-      (attachment.fileName?.length || 0) +
-      (attachment.data?.length || 0) +
-      (attachment.url?.length || 0),
-    0,
-  );
-}
-
-function resolveModelStringMetadata(model: string): ModelMetadata | undefined {
-  const { modelName } = parseModelString(model);
-  return resolveModelMetadata(modelName);
-}
-
-function resolveTextGenerationModel({
-  selectedModel,
-  selectedModelMetadata,
-  providers,
-}: {
-  selectedModel: string;
-  selectedModelMetadata?: ModelMetadata;
-  providers: Array<{
-    id: string;
-    enabled?: boolean;
-    models?: string[];
-  }>;
-}): string | undefined {
-  if (supportsTextOutput(selectedModelMetadata)) return selectedModel;
-
-  const taskModel = getTaskModel("promptOptimization").trim();
-  if (taskModel && supportsTextOutput(resolveModelStringMetadata(taskModel))) {
-    return taskModel;
-  }
-
-  const fallback = providers
-    .filter((provider) => provider.enabled)
-    .flatMap((provider) =>
-      (provider.models || []).map((modelName) => ({
-        id: `${provider.id}:${modelName}`,
-        metadata: resolveModelMetadata(modelName),
-      })),
-    )
-    .find((candidate) => supportsTextOutput(candidate.metadata));
-
-  return fallback?.id;
-}
-
-async function decideExternalSearchUse({
-  model,
-  history,
-  message,
-  signal,
-}: {
-  model: string;
-  history: Message[];
-  message: string;
-  signal?: AbortSignal;
-}): Promise<SearchDecision> {
-  try {
-    const rawDecision = await streamGenerateContent(
-      model,
-      createSearchDecisionPrompt({ history, message }),
-      () => {},
-      signal,
-    );
-    return parseSearchDecisionResult(rawDecision, message);
-  } catch (error) {
-    if (error instanceof DOMException && error.name === "AbortError") {
-      throw error;
-    }
-    logDevWarn("Search decision failed:", error);
-    return { shouldSearch: false, query: message };
-  }
 }
 
 export const executeCode = async (
@@ -401,6 +219,7 @@ export const executeCode = async (
 
 export const generateChatTitle = async (
   history: Message[],
+  signal?: AbortSignal,
 ): Promise<string> => {
   const fallbackTitle = () =>
     normalizeSessionTitle(history.find((m) => m.role === "user")?.content);
@@ -428,10 +247,11 @@ export const generateChatTitle = async (
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
-          provider: await buildProviderRuntimeConfig(targetProvider),
+          provider: await buildProviderRuntimeConfig(targetProvider, signal),
           modelName,
           history,
         }),
+        signal,
       }),
     );
 
@@ -447,6 +267,7 @@ export const generateChatTitle = async (
     );
     return normalizeSessionTitle(data.title);
   } catch (error) {
+    if (isAbortError(error, signal)) throw error;
     logDevError("Title generation error:", error);
     return fallbackTitle();
   }
@@ -454,6 +275,7 @@ export const generateChatTitle = async (
 
 export const generateRelatedQuestions = async (
   history: Message[],
+  signal?: AbortSignal,
 ): Promise<string[]> => {
   const { providers } = useCoreSettingsStore.getState();
   const provider = providers.find((p) => p.enabled);
@@ -479,10 +301,11 @@ export const generateRelatedQuestions = async (
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
-          provider: await buildProviderRuntimeConfig(targetProvider),
+          provider: await buildProviderRuntimeConfig(targetProvider, signal),
           modelName,
           history,
         }),
+        signal,
       }),
     );
 
@@ -501,6 +324,7 @@ export const generateRelatedQuestions = async (
     );
     return data.questions || [];
   } catch (error) {
+    if (isAbortError(error, signal)) throw error;
     logDevError("Related questions error:", error);
     return [];
   }
@@ -508,6 +332,7 @@ export const generateRelatedQuestions = async (
 
 export const generateRAGSearchQueries = async (
   userPrompt: string,
+  signal?: AbortSignal,
 ): Promise<string[]> => {
   const { providers } = useCoreSettingsStore.getState();
   const provider = providers.find((p) => p.enabled);
@@ -533,10 +358,11 @@ export const generateRAGSearchQueries = async (
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
-          provider: await buildProviderRuntimeConfig(targetProvider),
+          provider: await buildProviderRuntimeConfig(targetProvider, signal),
           modelName,
           userMessage: userPrompt,
         }),
+        signal,
       }),
     );
 
@@ -555,6 +381,7 @@ export const generateRAGSearchQueries = async (
     );
     return data.queries || [userPrompt];
   } catch (error) {
+    if (isAbortError(error, signal)) throw error;
     logDevError("RAG queries error:", error);
     return [userPrompt];
   }
@@ -586,7 +413,7 @@ export const generateImage = async (
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
-          provider: await buildProviderRuntimeConfig(provider),
+          provider: await buildProviderRuntimeConfig(provider, signal),
           modelName,
           prompt,
           imageCount: options.imageCount,
@@ -606,12 +433,15 @@ export const generateImage = async (
       images?: Attachment[];
       message?: string;
     }>(response, "Image generation failed");
-    const images = await cacheGeneratedImageAttachments(data.images || []);
+    const images = await cacheGeneratedImageAttachments(data.images || [], {
+      signal,
+    });
     return {
       images,
       message: data.message || "No images generated.",
     };
   } catch (error) {
+    if (isAbortError(error, signal)) throw createAbortError(signal);
     logDevError("Image generation error:", error);
     throw error;
   }
@@ -685,85 +515,20 @@ export const streamChatResponse = async (
     onSearchStatus &&
     searchCompatibility.mode === "external"
   ) {
-    let externalSearchStarted = false;
-    try {
-      const searchDecisionModel = resolveTextGenerationModel({
-        selectedModel: model,
-        selectedModelMetadata,
-        providers,
-      });
-      if (!searchDecisionModel) {
-        onSearchStatus(false, { sources: [], images: [] });
-      } else {
-        const decision = await decideExternalSearchUse({
-          model: searchDecisionModel,
-          history,
-          message: newMessage,
-          signal,
-        });
-
-        if (!decision.shouldSearch) {
-          onSearchStatus(false, { sources: [], images: [] });
-        } else {
-          outputBlockBuilder.upsertSearch({ isSearching: true });
-          externalSearchStarted = true;
-          onSearchStatus(true);
-          emitOutputBlocks();
-          const searchResults = await createSearchProvider({
-            query: decision.query,
-          });
-          outputBlockBuilder.upsertSearch({
-            isSearching: false,
-            results: searchResults,
-          });
-          onSearchStatus(false, searchResults);
-          emitOutputBlocks();
-
-          if (
-            searchResults.sources.length > 0 ||
-            searchResults.images.length > 0
-          ) {
-            const searchContext = buildSearchContextForPrompt({
-              sources: searchResults.sources,
-              images: searchResults.images,
-            });
-            const metadata = resolveModelMetadata(modelName);
-            const budget = allocateContextBudget({
-              modelInputTokenLimit: metadata?.limit?.context,
-              reservedOutputTokens: metadata?.limit?.output,
-              sources: {
-                history: getMessagesContextLength(history),
-                attachments: getAttachmentsContextLength(attachments),
-                search: searchContext.length,
-              },
-            });
-            const boundedSearchContext = trimTextToEstimatedTokens(
-              searchContext,
-              budget.allocations.search.maxTokens,
-            );
-
-            if (boundedSearchContext) {
-              effectiveNewMessage = appendContextToChatInput(
-                newMessage,
-                boundedSearchContext,
-                { separator: "\n\n" },
-              );
-            }
-          }
-        }
-      }
-    } catch (searchError) {
-      logDevWarn("Search preflight failed:", searchError);
-      if (externalSearchStarted) {
-        outputBlockBuilder.upsertSearch({
-          isSearching: false,
-          results: { sources: [], images: [] },
-          error: "Search provider failed",
-        });
-        emitOutputBlocks();
-      }
-      onSearchStatus(false, { sources: [], images: [] });
-    }
+    effectiveNewMessage = await runExternalSearchPreflight({
+      model,
+      modelName,
+      selectedModelMetadata,
+      providers,
+      history,
+      newMessage,
+      attachments,
+      signal,
+      generate: streamGenerateContent,
+      onSearchStatus,
+      upsertSearchBlock: outputBlockBuilder.upsertSearch,
+      emitOutputBlocks,
+    });
   }
 
   // Get plugin tools if activePlugins is provided
@@ -822,6 +587,7 @@ export const streamChatResponse = async (
       await stripAttachmentsDisplayCacheForModel(attachments);
     let requestConfig: Partial<ChatConfig> = { ...config };
     const maxToolRounds = PLUGIN_EXECUTION_LIMITS.maxToolRounds;
+    let executedToolCallCount = 0;
 
     if (
       requestConfig.imageCount === undefined &&
@@ -853,6 +619,14 @@ export const streamChatResponse = async (
       (!supportsTextOutput(selectedModelMetadata) ||
         modelName.toLowerCase().startsWith("gpt-image-"))
     ) {
+      boundHistoryForRequest([], {
+        newMessage: requestMessage,
+        attachments: requestAttachments,
+        systemInstruction: userSystemInstruction,
+        tools,
+        modelInputTokenLimit: selectedModelMetadata?.limit?.context,
+        reservedOutputTokens: selectedModelMetadata?.limit?.output,
+      });
       const loadingBlockId = outputBlockBuilder.appendImageGenerationStatus();
       emitOutputBlocks();
 
@@ -914,11 +688,15 @@ export const streamChatResponse = async (
       emitToolCalls();
     };
 
-    const runRound = async (): Promise<{
-      content: string;
-      reasoning: string;
-      toolCalls: ToolCall[];
-    }> => {
+    const runRound = async (): Promise<ChatStreamRoundResult> => {
+      const boundedRequestHistory = boundHistoryForRequest(requestHistory, {
+        newMessage: requestMessage,
+        attachments: requestAttachments,
+        modelInputTokenLimit: selectedModelMetadata?.limit?.context,
+        reservedOutputTokens: selectedModelMetadata?.limit?.output,
+        systemInstruction: userSystemInstruction,
+        tools,
+      });
       const response = await fetchWithByokRetry(async () =>
         signedApiFetch("/api/chat", {
           method: "POST",
@@ -926,9 +704,9 @@ export const streamChatResponse = async (
             "Content-Type": "application/json",
           },
           body: JSON.stringify({
-            provider: await buildProviderRuntimeConfig(provider),
+            provider: await buildProviderRuntimeConfig(provider, signal),
             modelName,
-            history: requestHistory,
+            history: boundedRequestHistory,
             newMessage: requestMessage,
             attachments: requestAttachments,
             config: requestConfig,
@@ -936,7 +714,8 @@ export const streamChatResponse = async (
             tools,
             enableImageGeneration:
               supportsImageGeneration(selectedModelMetadata) &&
-              (provider.type === "OpenAI" || provider.type === "Gemini"),
+              (provider.type === "OpenAI" ||
+                isGoogleProviderType(provider.type)),
             enableGoogleSearch:
               requestConfig?.useSearch &&
               searchCompatibility.mode === "gemini-google",
@@ -966,8 +745,15 @@ export const streamChatResponse = async (
       let buffer = "";
       const roundToolCalls: ToolCall[] = [];
 
+      const getRoundPayload = (): ChatStreamRoundPayload => ({
+        content: fullContent,
+        reasoning: fullReasoning,
+        toolCalls: roundToolCalls,
+      });
+
       const handleEventData = async (data: string) => {
-        if (!data || data === "[DONE]") return false;
+        if (!data) return false;
+        if (data === "[DONE]") return true;
         const parsed = JSON.parse(data);
 
         switch (parsed.type) {
@@ -1024,9 +810,10 @@ export const streamChatResponse = async (
 
           case "image":
             if (parsed.image) {
-              const [image] = await cacheGeneratedImageAttachments([
-                parsed.image,
-              ]);
+              const [image] = await cacheGeneratedImageAttachments(
+                [parsed.image],
+                { signal },
+              );
               outputBlockBuilder.appendImage(image);
               onChunk(
                 committedContent + fullContent,
@@ -1049,7 +836,7 @@ export const streamChatResponse = async (
           }
 
           case "error":
-            throw new Error(parsed.error);
+            throw createChatStreamEventError(parsed);
 
           case "done":
             if (outputBlockBuilder.finalizeActiveReasoning()) {
@@ -1074,56 +861,88 @@ export const streamChatResponse = async (
           return await handleEventData(dataLines.join("\n"));
         } catch (eventError) {
           if (eventError instanceof SyntaxError) {
-            logDevError("Failed to parse SSE data:", eventError);
-            return false;
+            throw new ChatStreamEventError(
+              "The response stream contained malformed data.",
+              "MALFORMED_CHAT_STREAM",
+            );
           }
           throw eventError;
         }
       };
 
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
+      const cancelReader = () => {
+        void reader.cancel(signal?.reason).catch(() => undefined);
+      };
+      signal?.addEventListener("abort", cancelReader, { once: true });
 
-        buffer += decoder.decode(value, { stream: true });
-        const events = buffer.split("\n\n");
-        buffer = events.pop() || "";
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
 
-        for (const event of events) {
-          const isDone = await processSSEEvent(event);
-          if (isDone) {
-            return {
-              content: fullContent,
-              reasoning: fullReasoning,
-              toolCalls: roundToolCalls,
-            };
+          buffer += decoder.decode(value, { stream: true });
+          const events = buffer.split("\n\n");
+          buffer = events.pop() || "";
+
+          for (const event of events) {
+            const isDone = await processSSEEvent(event);
+            if (isDone) {
+              await reader.cancel().catch(() => undefined);
+              return { status: "done", ...getRoundPayload() };
+            }
           }
         }
-      }
 
-      if (buffer.trim()) {
-        const isDone = await processSSEEvent(buffer);
-        if (isDone) {
+        if (buffer.trim()) {
+          const isDone = await processSSEEvent(buffer);
+          if (isDone) {
+            await reader.cancel().catch(() => undefined);
+            return { status: "done", ...getRoundPayload() };
+          }
+        }
+
+        if (signal?.aborted) {
           return {
-            content: fullContent,
-            reasoning: fullReasoning,
-            toolCalls: roundToolCalls,
+            status: "aborted",
+            error: createAbortError(signal),
+            ...getRoundPayload(),
           };
         }
-      }
 
-      if (outputBlockBuilder.finalizeActiveReasoning()) {
-        emitOutputBlocks();
+        if (outputBlockBuilder.finalizeActiveReasoning()) {
+          emitOutputBlocks();
+        }
+        return {
+          status: "incomplete",
+          error: new IncompleteChatStreamError(),
+          ...getRoundPayload(),
+        };
+      } catch (error) {
+        await reader.cancel().catch(() => undefined);
+        const normalizedError =
+          error instanceof Error ? error : new Error(String(error));
+        if (isAbortError(normalizedError, signal)) {
+          return {
+            status: "aborted",
+            error: createAbortError(signal),
+            ...getRoundPayload(),
+          };
+        }
+        return {
+          status: "error",
+          error: normalizedError,
+          ...getRoundPayload(),
+        };
+      } finally {
+        signal?.removeEventListener("abort", cancelReader);
       }
-      return {
-        content: fullContent,
-        reasoning: fullReasoning,
-        toolCalls: roundToolCalls,
-      };
     };
 
     for (let round = 0; round <= maxToolRounds; round++) {
       const result = await runRound();
+      if (result.status !== "done") {
+        throw result.error;
+      }
       const pendingToolCalls = result.toolCalls.filter(
         (toolCall) =>
           toolCall.name &&
@@ -1156,15 +975,38 @@ export const streamChatResponse = async (
         );
       }
 
-      pendingToolCalls.forEach((toolCall) => {
+      const remainingToolBudget = Math.max(
+        0,
+        PLUGIN_EXECUTION_LIMITS.maxTotalToolCalls - executedToolCallCount,
+      );
+      const toolCallsToExecute = pendingToolCalls.slice(0, remainingToolBudget);
+      const budgetSkippedToolCalls = pendingToolCalls
+        .slice(remainingToolBudget)
+        .map((toolCall): ToolCall => ({
+          ...toolCall,
+          status: "skipped",
+          isError: true,
+          result:
+            "Tool execution skipped because the per-generation total tool-call budget was reached.",
+        }));
+      budgetSkippedToolCalls.forEach((toolCall) => {
+        outputBlockBuilder.updateToolCall(toolCall);
+        emitOutputBlocks();
+        upsertToolCall(toolCall);
+      });
+      executedToolCallCount += toolCallsToExecute.length;
+
+      toolCallsToExecute.forEach((toolCall) => {
         const runningToolCall: ToolCall = { ...toolCall, status: "running" };
         outputBlockBuilder.updateToolCall(runningToolCall);
         emitOutputBlocks();
         upsertToolCall(runningToolCall);
       });
 
-      const executedToolCalls = await Promise.all(
-        pendingToolCalls.map(async (toolCall) => {
+      const completedToolCalls = await mapWithConcurrency(
+        toolCallsToExecute,
+        PLUGIN_EXECUTION_LIMITS.maxToolConcurrency,
+        async (toolCall) => {
           try {
             const resultData = isInternalMemoryTool(toolCall.name)
               ? await executeMemorySearchTool(toolCall.args)
@@ -1193,6 +1035,7 @@ export const streamChatResponse = async (
             upsertToolCall(completed);
             return completed;
           } catch (toolError) {
+            if (isAbortError(toolError, signal)) throw toolError;
             const failed: ToolCall = {
               ...toolCall,
               status: "error",
@@ -1207,8 +1050,12 @@ export const streamChatResponse = async (
             upsertToolCall(failed);
             return failed;
           }
-        }),
+        },
       );
+      const executedToolCalls = [
+        ...completedToolCalls,
+        ...budgetSkippedToolCalls,
+      ];
 
       committedContent = result.content
         ? `${committedContent}${result.content}\n\n`
@@ -1242,9 +1089,6 @@ export const streamChatResponse = async (
 
     return committedContent;
   } catch (error) {
-    if (error instanceof DOMException && error.name === "AbortError") {
-      throw error;
-    }
     throw error;
   }
 };
@@ -1264,7 +1108,10 @@ const getCompressionConfig = () => {
 };
 
 // Generate summary using backend API
-const generateSummary = async (text: string): Promise<string> => {
+const generateSummary = async (
+  text: string,
+  signal?: AbortSignal,
+): Promise<string> => {
   try {
     // Use configured task model
     const summaryModel = getTaskModel("contextCompression");
@@ -1275,9 +1122,11 @@ const generateSummary = async (text: string): Promise<string> => {
       summaryModel,
       prompt,
       () => {},
+      signal,
     );
     return response;
   } catch (e) {
+    if (isAbortError(e, signal)) throw e;
     logDevWarn("Summary generation failed, returning raw truncation", e);
     return normalizeCompressedContent(
       `${text.slice(0, 1000)}... [Summary Failed]`,
@@ -1382,12 +1231,14 @@ export const performBackgroundCompression = async (
   allMessages: Message[],
   currentCompression: Session["compression"],
   model: string,
+  signal?: AbortSignal,
 ): Promise<Session["compression"] | null> => {
   const { thresholdMessages, keepMessages } = getCompressionConfig();
 
   // 1. Identify Uncompressed Segment
   let startIndex = 0;
   let oldContent = "";
+  let oldIncludedMemoryIds: string[] = [];
 
   if (currentCompression) {
     const lastIdx = allMessages.findIndex(
@@ -1395,7 +1246,12 @@ export const performBackgroundCompression = async (
     );
     if (lastIdx !== -1) {
       startIndex = lastIdx + 1;
-      oldContent = currentCompression.compressedContent;
+      const normalizedPrevious = normalizeCompressedContentWithMemoryIds({
+        content: currentCompression.compressedContent,
+        memoryIds: currentCompression.includedMemoryIds || [],
+      });
+      oldContent = normalizedPrevious.content;
+      oldIncludedMemoryIds = normalizedPrevious.representedMemoryIds;
     }
   } else {
     // If no previous compression, start from index 1 (keeping index 0 User safe)
@@ -1413,37 +1269,39 @@ export const performBackgroundCompression = async (
   // We keep the last 'keepMessages' raw. Compress everything else in the uncompressed segment.
   const splitIndex = uncompressedMessages.length - keepMessages;
   const messagesToCompress = uncompressedMessages.slice(0, splitIndex);
-  const lastCompressedMsg = messagesToCompress[messagesToCompress.length - 1];
-
-  if (!lastCompressedMsg) return null;
+  if (messagesToCompress.length === 0) return null;
 
   // 4. Generate Content
-  const textToCompress = messagesToCompress
-    .map((m) => `[${m.role.toUpperCase()}]: ${m.content}`)
-    .join("\n\n");
+  const compressionSource = buildCompressionSource(messagesToCompress);
+  if (!compressionSource.lastIncludedMessageId) return null;
+  const textToCompress = compressionSource.text;
 
   const { modelMetadata, customModelMetadata } = useSettingsStore.getState();
   const { modelName: modelId } = parseModelString(model);
   const meta = customModelMetadata[modelId] || modelMetadata[modelId];
   const supportAttachment = meta ? (meta.attachment ?? false) : true;
 
-  let newCompressedContent = "";
+  let nextCompressedContent = textToCompress;
 
-  if (supportAttachment) {
-    // Append raw text
-    newCompressedContent = mergeCompressedContent(oldContent, textToCompress);
-  } else {
+  if (!supportAttachment) {
     // Generate Summary
-    const summary = await generateSummary(textToCompress);
-    newCompressedContent = mergeCompressedContent(
-      oldContent,
-      oldContent ? `[New Summary Segment]:\n${summary}` : summary,
-    );
+    const summary = await generateSummary(textToCompress, signal);
+    nextCompressedContent = oldContent
+      ? `[New Summary Segment]:\n${summary}`
+      : summary;
   }
 
+  const mergedCompression = mergeCompressedContentWithMemoryIds({
+    previousContent: oldContent,
+    previousMemoryIds: oldIncludedMemoryIds,
+    nextContent: nextCompressedContent,
+    nextMemoryIds: compressionSource.includedMemoryIds,
+  });
+
   return {
-    compressedContent: newCompressedContent,
-    lastCompressedMessageId: lastCompressedMsg.id,
+    compressedContent: mergedCompression.content,
+    lastCompressedMessageId: compressionSource.lastIncludedMessageId,
+    includedMemoryIds: mergedCompression.representedMemoryIds,
   };
 };
 
@@ -1463,6 +1321,7 @@ export const streamGenerateContent = async (
 
   if (!provider) throw new Error("No provider found");
 
+  let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
   try {
     const response = await fetchWithByokRetry(async () =>
       signedApiFetch("/api/chat/generate", {
@@ -1471,7 +1330,7 @@ export const streamGenerateContent = async (
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
-          provider: await buildProviderRuntimeConfig(provider),
+          provider: await buildProviderRuntimeConfig(provider, signal),
           modelName,
           prompt,
         }),
@@ -1485,12 +1344,46 @@ export const streamGenerateContent = async (
       );
     }
 
-    const reader = response.body?.getReader();
+    reader = response.body?.getReader();
     if (!reader) throw new Error("No response body");
 
     const decoder = new TextDecoder();
     let fullText = "";
     let buffer = "";
+
+    const processEvent = (event: string): boolean => {
+      const data = event
+        .split("\n")
+        .filter((line) => line.startsWith("data: "))
+        .map((line) => line.slice(6))
+        .join("\n");
+
+      if (!data) return false;
+      if (data === "[DONE]") return true;
+
+      let parsed: any;
+      try {
+        parsed = JSON.parse(data);
+      } catch {
+        throw new ChatStreamEventError(
+          "The response stream contained malformed data.",
+          "MALFORMED_CHAT_STREAM",
+        );
+      }
+
+      switch (parsed.type) {
+        case "content":
+          fullText += parsed.content;
+          onChunk(fullText);
+          return false;
+        case "error":
+          throw createChatStreamEventError(parsed);
+        case "done":
+          return true;
+        default:
+          return false;
+      }
+    };
 
     while (true) {
       const { done, value } = await reader.read();
@@ -1501,43 +1394,19 @@ export const streamGenerateContent = async (
       buffer = events.pop() || "";
 
       for (const event of events) {
-        const data = event
-          .split("\n")
-          .filter((line) => line.startsWith("data: "))
-          .map((line) => line.slice(6))
-          .join("\n");
-
-        if (!data || data === "[DONE]") continue;
-
-        try {
-          const parsed = JSON.parse(data);
-
-          switch (parsed.type) {
-            case "content":
-              fullText += parsed.content;
-              onChunk(fullText); // Pass accumulated text, not just the chunk
-              break;
-
-            case "error":
-              throw new Error(parsed.error);
-
-            case "done":
-              return fullText;
-          }
-        } catch (e) {
-          if (e instanceof Error && data.includes('"type":"error"')) {
-            throw e;
-          }
-          logDevError("Failed to parse SSE data:", e);
+        if (processEvent(event)) {
+          await reader.cancel().catch(() => undefined);
+          return fullText;
         }
       }
     }
 
-    return fullText;
+    if (buffer.trim() && processEvent(buffer)) return fullText;
+    if (signal?.aborted) throw createAbortError(signal);
+    throw new IncompleteChatStreamError();
   } catch (error) {
-    if (error instanceof DOMException && error.name === "AbortError") {
-      throw error;
-    }
+    await reader?.cancel().catch(() => undefined);
+    if (isAbortError(error, signal)) throw createAbortError(signal);
     logDevError("Stream generate error:", error);
     throw error;
   }
@@ -1571,7 +1440,7 @@ export const streamGenerateToolCall = async (
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
-          provider: await buildProviderRuntimeConfig(provider),
+          provider: await buildProviderRuntimeConfig(provider, signal),
           modelName,
           history: [],
           newMessage: prompt,
@@ -1594,26 +1463,37 @@ export const streamGenerateToolCall = async (
 
     const decoder = new TextDecoder();
     let buffer = "";
+    let pendingToolCall: ToolCall | null = null;
 
-    const readEvent = (event: string): ToolCall | null | undefined => {
+    const readEvent = (event: string): "done" | "continue" => {
       const data = event
         .split("\n")
         .filter((line) => line.startsWith("data: "))
         .map((line) => line.slice(6))
         .join("\n");
 
-      if (!data || data === "[DONE]") return undefined;
+      if (!data) return "continue";
+      if (data === "[DONE]") return "done";
 
-      const parsed = JSON.parse(data);
+      let parsed: any;
+      try {
+        parsed = JSON.parse(data);
+      } catch {
+        throw new ChatStreamEventError(
+          "The response stream contained malformed data.",
+          "MALFORMED_CHAT_STREAM",
+        );
+      }
       switch (parsed.type) {
         case "tool_call":
-          return parsed.toolCall || null;
+          pendingToolCall = parsed.toolCall || null;
+          return "continue";
         case "error":
-          throw new Error(parsed.error);
+          throw createChatStreamEventError(parsed);
         case "done":
-          return null;
+          return "done";
         default:
-          return undefined;
+          return "continue";
       }
     };
 
@@ -1626,22 +1506,25 @@ export const streamGenerateToolCall = async (
       buffer = events.pop() || "";
 
       for (const event of events) {
-        const result = readEvent(event);
-        if (result !== undefined) {
+        if (readEvent(event) === "done") {
           await reader.cancel().catch(() => undefined);
-          return result;
+          return pendingToolCall;
         }
       }
     }
 
     if (buffer.trim()) {
-      const result = readEvent(buffer);
-      if (result !== undefined) return result;
+      if (readEvent(buffer) === "done") return pendingToolCall;
     }
 
-    return null;
+    if (signal?.aborted) throw createAbortError(signal);
+    throw new IncompleteChatStreamError();
   } catch (error) {
-    if (error instanceof DOMException && error.name === "AbortError") {
+    if (isAbortError(error, signal)) throw createAbortError(signal);
+    if (
+      error instanceof IncompleteChatStreamError ||
+      error instanceof ChatStreamEventError
+    ) {
       throw error;
     }
     logDevWarn("Skill tool selection failed:", error);
@@ -1660,6 +1543,7 @@ export const performBackgroundMemoryExtraction = async ({
   assistantMessage: Pick<Message, "id" | "content">;
   signal?: AbortSignal;
 }) => {
+  if (signal?.aborted) throw createAbortError(signal);
   const state = useMemoryStore.getState();
   const { _hasHydrated, settings } = state;
   if (
@@ -1682,6 +1566,7 @@ export const performBackgroundMemoryExtraction = async ({
     [coerceToolDefinition(MEMORY_RECORD_TOOL)],
     signal,
   );
+  if (signal?.aborted) throw createAbortError(signal);
 
   if (!toolCall || toolCall.name !== MEMORY_RECORD_TOOL_NAME) return [];
 
@@ -1691,6 +1576,7 @@ export const performBackgroundMemoryExtraction = async ({
     sourceMessageIds: [userMessage.id, assistantMessage.id],
   });
   if (memories.length === 0) return [];
+  if (signal?.aborted) throw createAbortError(signal);
 
   const saved = useMemoryStore.getState().upsertMemories(memories);
   const nextState = useMemoryStore.getState();
@@ -1699,7 +1585,11 @@ export const performBackgroundMemoryExtraction = async ({
     nextState.settings.dreamEnabled &&
     nextState.memories.length > nextState.settings.triggerCount
   ) {
-    void performMemoryDream({ force: false, signal });
+    void performMemoryDream({ force: false, signal }).catch((error) => {
+      if (!isAbortError(error, signal)) {
+        logDevWarn("Memory dream failed:", error);
+      }
+    });
   }
 
   return saved;
@@ -1712,6 +1602,7 @@ export const performMemoryDream = async ({
   force?: boolean;
   signal?: AbortSignal;
 } = {}) => {
+  if (signal?.aborted) throw createAbortError(signal);
   const state = useMemoryStore.getState();
   const { _hasHydrated, settings, memories, dreamStatus } = state;
   if (
@@ -1750,10 +1641,15 @@ export const performMemoryDream = async ({
       throw new Error("Memory dream returned an invalid memory set.");
     }
 
+    if (signal?.aborted) throw createAbortError(signal);
     useMemoryStore.getState().replaceMemories(dreamed);
     useMemoryStore.getState().finishDream();
     return dreamed;
   } catch (error) {
+    if (isAbortError(error, signal)) {
+      useMemoryStore.getState().finishDream();
+      throw createAbortError(signal);
+    }
     const message = error instanceof Error ? error.message : String(error);
     useMemoryStore.getState().finishDream(message);
     logDevWarn("Memory dream failed:", error);

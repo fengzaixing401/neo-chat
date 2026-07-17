@@ -4,6 +4,11 @@
 
 import type { Message, ReasoningMode } from "@/types";
 import { ProviderFactory, ProviderConfig } from "../providers/base";
+import {
+  createAnthropicMessageText,
+  convertToolsToAnthropic,
+  streamAnthropicMessages,
+} from "../streaming/anthropic";
 import { streamGeminiResponse } from "../streaming/gemini";
 import {
   streamOpenAIChatCompletions,
@@ -16,14 +21,21 @@ import {
 } from "../streaming/sse";
 import {
   prepareGeminiHistory,
+  prepareAnthropicMessages,
   prepareOpenAIHistory,
   prepareOpenAIResponsesInput,
 } from "../utils/history";
-import { convertAttachmentsToOpenAIResponses } from "../utils/attachments";
+import {
+  convertAttachmentsToAnthropic,
+  convertAttachmentsToOpenAI,
+  convertAttachmentsToOpenAIResponses,
+} from "../utils/attachments";
 import { convertSchemaToGemini } from "../utils/schema";
 import { logDevWarn } from "../utils/devLogger";
 import {
   isOpenAIProviderType,
+  isAnthropicProviderType,
+  isGoogleProviderType,
   OPENAI_COMPATIBLE_PROVIDER_TYPE,
 } from "../providers/providerTypes";
 import { safeServerLogError } from "../utils/safeServerLog";
@@ -45,6 +57,7 @@ export interface ChatHandlerOptions {
   enableImageGeneration?: boolean;
   enableGoogleSearch?: boolean;
   enableOpenAIWebSearch?: boolean;
+  signal?: AbortSignal;
 }
 
 function getProviderBaseUrlHost(provider: ProviderConfig): string | undefined {
@@ -95,6 +108,13 @@ function getChatStreamErrorDetails(error: unknown) {
     code: getErrorStringField(record, "code"),
     type: getErrorStringField(record, "type"),
   };
+}
+
+function isAbortError(error: unknown, signal?: AbortSignal): boolean {
+  return (
+    signal?.aborted === true ||
+    (error instanceof Error && error.name === "AbortError")
+  );
 }
 
 function logChatStreamError(error: unknown, options: ChatHandlerOptions): void {
@@ -162,6 +182,7 @@ export async function handleChatStream(options: ChatHandlerOptions) {
     enableImageGeneration,
     enableGoogleSearch,
     enableOpenAIWebSearch,
+    signal,
   } = options;
 
   const stream = createStreamHandler(async (controller) => {
@@ -169,7 +190,7 @@ export async function handleChatStream(options: ChatHandlerOptions) {
       const send = createSSESender(controller);
 
       if (provider.type === "OpenAI") {
-        await ProviderFactory.assertProviderOutboundAllowed(provider);
+        await ProviderFactory.assertProviderOutboundAllowed(provider, signal);
         const client = ProviderFactory.createOpenAIClient(provider);
         const input = prepareOpenAIResponsesInput(history);
 
@@ -193,17 +214,18 @@ export async function handleChatStream(options: ChatHandlerOptions) {
           reasoningMode: config?.reasoningMode,
           enableImageGeneration,
           enableWebSearch: enableOpenAIWebSearch,
+          signal,
           onChunk: send,
         });
       } else if (provider.type === OPENAI_COMPATIBLE_PROVIDER_TYPE) {
-        await ProviderFactory.assertProviderOutboundAllowed(provider);
+        await ProviderFactory.assertProviderOutboundAllowed(provider, signal);
         const messages = prepareOpenAIHistory(history);
 
         // 添加新消息
         const content: any[] = [{ type: "text", text: newMessage }];
         if (attachments?.length) {
           // 转换附件格式
-          content.push(...attachments);
+          content.push(...convertAttachmentsToOpenAI(attachments));
         }
         messages.push({ role: "user", content });
 
@@ -221,12 +243,39 @@ export async function handleChatStream(options: ChatHandlerOptions) {
           tools,
           useReasoning: config?.useReasoning,
           reasoningMode: config?.reasoningMode,
+          signal,
           onChunk: send,
         });
-      } else {
-        // Gemini
-        await ProviderFactory.assertProviderOutboundAllowed(provider);
-        const client = ProviderFactory.createGeminiClient(provider);
+      } else if (isAnthropicProviderType(provider.type)) {
+        await ProviderFactory.assertProviderOutboundAllowed(provider, signal);
+        const client = ProviderFactory.createAnthropicClient(provider);
+        const messages = prepareAnthropicMessages(history);
+        const content: any[] = [];
+        if (newMessage) content.push({ type: "text", text: newMessage });
+        if (attachments?.length) {
+          content.push(...convertAttachmentsToAnthropic(attachments));
+        }
+        messages.push({
+          role: "user",
+          content: content.length > 0 ? content : " ",
+        });
+
+        await streamAnthropicMessages({
+          client,
+          model: modelName,
+          messages,
+          system: systemInstruction,
+          temperature: config?.temperature,
+          tools: convertToolsToAnthropic(tools),
+          useReasoning: config?.useReasoning,
+          reasoningMode: config?.reasoningMode,
+          signal,
+          onChunk: send,
+        });
+      } else if (isGoogleProviderType(provider.type)) {
+        // Google
+        await ProviderFactory.assertProviderOutboundAllowed(provider, signal);
+        const client = ProviderFactory.createGoogleClient(provider);
         const contents = prepareGeminiHistory(history);
 
         // 添加新消息
@@ -296,12 +345,19 @@ export async function handleChatStream(options: ChatHandlerOptions) {
           imageCount: config?.imageCount,
           useReasoning: config?.useReasoning,
           reasoningMode: config?.reasoningMode,
+          signal,
           onChunk: send,
         });
+      } else {
+        throw new Error(`Unsupported provider type: ${provider.type}`);
       }
 
+      signal?.throwIfAborted();
       send({ type: "done" });
     } catch (error) {
+      if (isAbortError(error, signal)) {
+        return;
+      }
       logChatStreamError(error, options);
       throw error;
     }
@@ -317,33 +373,56 @@ export async function handleSimpleGeneration(
   provider: ProviderConfig,
   modelName: string,
   prompt: string,
+  signal?: AbortSignal,
 ): Promise<string> {
-  await ProviderFactory.assertProviderOutboundAllowed(provider);
+  await ProviderFactory.assertProviderOutboundAllowed(provider, signal);
 
   if (provider.type === "OpenAI") {
     const client = ProviderFactory.createOpenAIClient(provider);
-    const response = await client.responses.create({
+    const request: any = {
       model: modelName,
       input: prompt,
       temperature: 0.7,
-    });
+    };
+    const response = signal
+      ? await client.responses.create(request, { signal })
+      : await client.responses.create(request);
     return getResponsesOutputText(response);
   }
 
   if (isOpenAIProviderType(provider.type)) {
     const client = ProviderFactory.createOpenAIClient(provider);
-    const response = await client.chat.completions.create({
+    const request: any = {
       model: modelName,
       messages: [{ role: "user", content: prompt }],
       temperature: 0.7,
-    });
+    };
+    const response = signal
+      ? await client.chat.completions.create(request, { signal })
+      : await client.chat.completions.create(request);
     return response.choices[0]?.message?.content || "";
-  } else {
-    const client = ProviderFactory.createGeminiClient(provider);
-    const result = await client.models.generateContent({
+  }
+
+  if (isAnthropicProviderType(provider.type)) {
+    const client = ProviderFactory.createAnthropicClient(provider);
+    return createAnthropicMessageText({
+      client,
+      model: modelName,
+      prompt,
+      signal,
+    });
+  }
+
+  if (isGoogleProviderType(provider.type)) {
+    const client = ProviderFactory.createGoogleClient(provider);
+    const request: any = {
       model: modelName,
       contents: { parts: [{ text: prompt }] },
-    });
+    };
+    if (signal) request.config = { abortSignal: signal };
+    const result = await client.models.generateContent(request);
     return result.text || "";
   }
+
+  throw new Error(`Unsupported provider type: ${provider.type}`);
 }

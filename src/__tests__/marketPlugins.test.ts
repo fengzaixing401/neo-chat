@@ -52,6 +52,66 @@ describe("market plugin normalization", () => {
     ).toBeNull();
   });
 
+  it("keeps MCP metadata HTTPS-only while allowing LAN endpoints", () => {
+    expect(
+      normalizeMarketPlugin({
+        id: "mcp:lan:1.0.0",
+        source: "mcp",
+        title: "LAN MCP",
+        manifestUrl:
+          "https://registry.modelcontextprotocol.io/v0.1/servers/lan",
+        mcp: {
+          transport: "streamable-http",
+          serverUrl: "https://192.168.1.10/mcp",
+          serverName: "lan",
+          headers: { "X-Client": "neo-chat" },
+          toolNameMap: {},
+        },
+      }),
+    ).toMatchObject({
+      source: "mcp",
+      mcp: {
+        serverUrl: "https://192.168.1.10/mcp",
+        headers: { "X-Client": "neo-chat" },
+      },
+    });
+
+    expect(
+      normalizeMarketPlugin({
+        id: "mcp:lan-http:1.0.0",
+        source: "mcp",
+        title: "LAN HTTP MCP",
+        manifestUrl: "",
+        mcp: {
+          transport: "streamable-http",
+          serverUrl: "http://192.168.1.10/mcp",
+          serverName: "lan-http",
+          toolNameMap: {},
+        },
+      }),
+    ).toBeNull();
+  });
+
+  it("keeps root-relative plugin logos for local default assets", () => {
+    expect(
+      normalizeMarketPlugin({
+        id: "mcp:local-logo:1.0.0",
+        source: "mcp",
+        title: "Local Logo MCP",
+        logoUrl: "/mcp-logo.svg",
+        manifestUrl: "",
+        mcp: {
+          transport: "streamable-http",
+          serverUrl: "https://mcp.example.com/mcp",
+          serverName: "local-logo",
+          toolNameMap: {},
+        },
+      }),
+    ).toMatchObject({
+      logoUrl: "/mcp-logo.svg",
+    });
+  });
+
   it("deduplicates and caps plugin lists", () => {
     const plugins = Array.from(
       { length: MARKET_LIMITS.maxPlugins + 10 },

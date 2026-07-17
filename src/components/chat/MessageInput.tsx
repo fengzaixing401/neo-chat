@@ -63,7 +63,7 @@ import {
   getAttachmentPayloadChars,
   getAttachmentsPayloadChars,
 } from "@/config/limits";
-import { parseModelString, supportsModality } from "@/lib/utils/model";
+import { parseModelString } from "@/lib/utils/model";
 import { stopMediaStreamTracks } from "@/lib/utils/mediaRecording";
 import { logDevError } from "@/lib/utils/devLogger";
 import { saveToOPFS } from "@/utils/opfs";
@@ -92,11 +92,13 @@ import {
   truncateMiddle,
 } from "@/lib/utils/messageInputHelpers";
 import {
-  getAvailableReasoningModes,
   isReasoningEnabled,
   normalizeReasoningMode,
-  resolveReasoningModeForModel,
 } from "@/lib/chat/reasoning";
+import {
+  useComposerCapabilityState,
+  useComposerMenuState,
+} from "@/features/chat";
 
 type MessageInputVariant = "default" | "hero";
 
@@ -124,7 +126,7 @@ const iconButtonFocusClass =
   "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-400/40 focus-visible:ring-offset-2 focus-visible:ring-offset-white dark:focus-visible:ring-offset-background";
 
 const iconButtonBaseClass =
-  "inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg";
+  "inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-lg";
 
 const loadChatService = () => import("@/services/api/chatService");
 
@@ -148,11 +150,18 @@ const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
     const [isRecording, setIsRecording] = useState(false);
     const [isTranscribing, setIsTranscribing] = useState(false);
     const [recordingSeconds, setRecordingSeconds] = useState(0);
-    const [showModelSelect, setShowModelSelect] = useState(false);
-    const [showSkillSelect, setShowSkillSelect] = useState(false);
-    const [showPluginSelect, setShowPluginSelect] = useState(false);
-    const [showReasoningSelect, setShowReasoningSelect] = useState(false);
-    const [showAttachMenu, setShowAttachMenu] = useState(false);
+    const {
+      showAttachMenu,
+      showSkillSelect,
+      showPluginSelect,
+      showReasoningSelect,
+      showModelSelect,
+      setShowAttachMenu,
+      setShowSkillSelect,
+      setShowPluginSelect,
+      setShowReasoningSelect,
+      setShowModelSelect,
+    } = useComposerMenuState();
     const [showRemoteModal, setShowRemoteModal] = useState(false);
     const [showKBModal, setShowKBModal] = useState(false);
     const [errorMsg, setErrorMsg] = useState<string | null>(null);
@@ -178,7 +187,6 @@ const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
       installedSkills,
       pluginConfigs,
       voice,
-      updateVoiceSettings,
       search,
       rag,
       serverConfig,
@@ -342,20 +350,6 @@ const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
       }
     }, [errorMsg]);
 
-    useEffect(() => {
-      const handleEscape = (e: KeyboardEvent) => {
-        if (e.key !== "Escape") return;
-        setShowAttachMenu(false);
-        setShowSkillSelect(false);
-        setShowPluginSelect(false);
-        setShowReasoningSelect(false);
-        setShowModelSelect(false);
-      };
-
-      document.addEventListener("keydown", handleEscape);
-      return () => document.removeEventListener("keydown", handleEscape);
-    }, []);
-
     const selectedModelProvider = useMemo(() => {
       if (!selectedModel) return providers.find((provider) => provider.enabled);
       const { providerId } = parseModelString(selectedModel);
@@ -476,61 +470,9 @@ const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
       return groups;
     }, [availableModels]);
 
-    const selectedModelMetadata = useMemo(() => {
-      if (!selectedModel) return undefined;
-
-      const { modelName: modelId } = parseModelString(selectedModel);
-      return customModelMetadata[modelId] || modelMetadata[modelId];
-    }, [selectedModel, modelMetadata, customModelMetadata]);
-
-    // --- Capabilities Resolution ---
-    const modelCapabilities = useMemo(() => {
-      if (!selectedModel)
-        return {
-          vision: false,
-          attachment: false,
-          audio: false,
-          video: false,
-          reasoning: false,
-        };
-
-      return {
-        vision: supportsModality(selectedModelMetadata, "image", "input"),
-        attachment: selectedModelMetadata?.attachment ?? false,
-        audio: supportsModality(selectedModelMetadata, "audio", "input"),
-        video: supportsModality(selectedModelMetadata, "video", "input"),
-        reasoning: selectedModelMetadata?.reasoning ?? false,
-      };
-    }, [selectedModel, selectedModelMetadata]);
-
     const maxAttachmentFileBytes =
       serverConfig?.limits?.attachments?.maxFileBytes ??
       ATTACHMENT_LIMITS.maxFileBytes;
-
-    const isReasoningSupported = useMemo(() => {
-      if (!selectedModel) return false;
-      const { modelName: modelId } = parseModelString(selectedModel);
-
-      if (selectedModelMetadata?.reasoning !== undefined) {
-        return selectedModelMetadata.reasoning;
-      }
-
-      // Fallback to name heuristic
-      const lower = modelId.toLowerCase();
-      return (
-        lower.includes("thinking") ||
-        lower.includes("reasoner") ||
-        lower.includes("o1") ||
-        lower.includes("r1")
-      );
-    }, [selectedModel, selectedModelMetadata]);
-
-    const currentReasoningMode = resolveReasoningModeForModel(
-      chatConfig.reasoningMode,
-      selectedModelMetadata,
-      chatConfig.useReasoning,
-    );
-    const isReasoningEnabledForMode = isReasoningEnabled(currentReasoningMode);
     const reasoningOptionLabels = useMemo<
       Record<ReasoningMode, { label: string; description: string }>
     >(
@@ -558,20 +500,21 @@ const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
       }),
       [t],
     );
-    const reasoningOptions = useMemo<
-      Array<{ value: ReasoningMode; label: string; description: string }>
-    >(
-      () =>
-        getAvailableReasoningModes(selectedModelMetadata).map((value) => ({
-          value,
-          ...reasoningOptionLabels[value],
-        })),
-      [selectedModelMetadata, reasoningOptionLabels],
-    );
-    const currentReasoningOption =
-      reasoningOptions.find(
-        (option) => option.value === currentReasoningMode,
-      ) || reasoningOptions[0];
+    const {
+      modelCapabilities,
+      isReasoningSupported,
+      currentReasoningMode,
+      isReasoningEnabledForMode,
+      reasoningOptions,
+      currentReasoningOption,
+    } = useComposerCapabilityState({
+      selectedModel,
+      modelMetadata,
+      customModelMetadata,
+      reasoningMode: chatConfig.reasoningMode,
+      useReasoning: chatConfig.useReasoning,
+      reasoningOptionLabels,
+    });
 
     // Filter plugins to show only those ready for use
     const validPlugins = useMemo(() => {
@@ -586,13 +529,34 @@ const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
         })
         .map((p) => localizePluginMeta(p, tConfig));
     }, [installedPlugins, pluginConfigs, tConfig]);
+    const pluginSourceGroups = useMemo(() => {
+      const groups: { plugins: typeof validPlugins; mcp: typeof validPlugins } =
+        {
+          plugins: [],
+          mcp: [],
+        };
+
+      validPlugins.forEach((plugin) => {
+        if (plugin.source === "mcp") {
+          groups.mcp.push(plugin);
+        } else {
+          groups.plugins.push(plugin);
+        }
+      });
+
+      return groups;
+    }, [validPlugins]);
 
     const handleKeyDown = (e: React.KeyboardEvent) => {
+      const requiresExplicitSend = window.matchMedia(
+        "(pointer: coarse), (max-width: 1023px)",
+      ).matches;
       if (
         shouldSubmitOnEnter({
           key: e.key,
           shiftKey: e.shiftKey,
           isComposing: e.nativeEvent.isComposing,
+          requiresExplicitSend,
         })
       ) {
         e.preventDefault();
@@ -1565,45 +1529,107 @@ const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
                 >
                   {validPlugins.length > 0 ? (
                     <>
-                      <DropdownMenuLabel>
-                        {t("installedPlugins")}
-                      </DropdownMenuLabel>
-                      {validPlugins.map((plugin) => {
-                        const isActive = activePlugins.includes(plugin.id);
-                        return (
-                          <DropdownMenuCheckboxItem
-                            checked={isActive}
-                            aria-label={
-                              isActive
-                                ? t("disablePlugin", { title: plugin.title })
-                                : t("enablePlugin", { title: plugin.title })
-                            }
-                            indicatorPosition="right"
-                            indicator={
-                              <span className="flex h-3 w-3 items-center justify-center rounded-full border border-cyan-500 bg-cyan-500">
-                                <span className="h-1.5 w-1.5 rounded-full bg-white" />
-                              </span>
-                            }
-                            key={plugin.id}
-                            onSelect={(event) => event.preventDefault()}
-                            onCheckedChange={() =>
-                              togglePluginActive(plugin.id)
-                            }
-                          >
-                            <span className="flex min-w-0 items-center gap-2 truncate">
-                              <SafeImage
-                                src={plugin.logoUrl}
-                                className="w-4 h-4 object-contain"
-                                alt=""
-                                fallback={
-                                  <Blocks size={14} aria-hidden="true" />
+                      {pluginSourceGroups.plugins.length > 0 && (
+                        <>
+                          <DropdownMenuLabel>
+                            {t("installedPlugins")}
+                          </DropdownMenuLabel>
+                          {pluginSourceGroups.plugins.map((plugin) => {
+                            const isActive = activePlugins.includes(plugin.id);
+                            return (
+                              <DropdownMenuCheckboxItem
+                                checked={isActive}
+                                aria-label={
+                                  isActive
+                                    ? t("disablePlugin", {
+                                        title: plugin.title,
+                                      })
+                                    : t("enablePlugin", {
+                                        title: plugin.title,
+                                      })
                                 }
-                              />
-                              <span className="truncate">{plugin.title}</span>
-                            </span>
-                          </DropdownMenuCheckboxItem>
-                        );
-                      })}
+                                indicatorPosition="right"
+                                indicator={
+                                  <span className="flex h-3 w-3 items-center justify-center rounded-full border border-cyan-500 bg-cyan-500">
+                                    <span className="h-1.5 w-1.5 rounded-full bg-white" />
+                                  </span>
+                                }
+                                key={plugin.id}
+                                onSelect={(event) => event.preventDefault()}
+                                onCheckedChange={() =>
+                                  togglePluginActive(plugin.id)
+                                }
+                              >
+                                <span className="flex min-w-0 items-center gap-2 truncate">
+                                  <SafeImage
+                                    src={plugin.logoUrl}
+                                    className="w-4 h-4 object-contain"
+                                    alt=""
+                                    fallback={
+                                      <Blocks size={14} aria-hidden="true" />
+                                    }
+                                  />
+                                  <span className="truncate">
+                                    {plugin.title}
+                                  </span>
+                                </span>
+                              </DropdownMenuCheckboxItem>
+                            );
+                          })}
+                        </>
+                      )}
+                      {pluginSourceGroups.mcp.length > 0 && (
+                        <>
+                          {pluginSourceGroups.plugins.length > 0 && (
+                            <DropdownMenuSeparator />
+                          )}
+                          <DropdownMenuLabel>
+                            {t("mcpServers")}
+                          </DropdownMenuLabel>
+                          {pluginSourceGroups.mcp.map((plugin) => {
+                            const isActive = activePlugins.includes(plugin.id);
+                            return (
+                              <DropdownMenuCheckboxItem
+                                checked={isActive}
+                                aria-label={
+                                  isActive
+                                    ? t("disablePlugin", {
+                                        title: plugin.title,
+                                      })
+                                    : t("enablePlugin", {
+                                        title: plugin.title,
+                                      })
+                                }
+                                indicatorPosition="right"
+                                indicator={
+                                  <span className="flex h-3 w-3 items-center justify-center rounded-full border border-cyan-500 bg-cyan-500">
+                                    <span className="h-1.5 w-1.5 rounded-full bg-white" />
+                                  </span>
+                                }
+                                key={plugin.id}
+                                onSelect={(event) => event.preventDefault()}
+                                onCheckedChange={() =>
+                                  togglePluginActive(plugin.id)
+                                }
+                              >
+                                <span className="flex min-w-0 items-center gap-2 truncate">
+                                  <SafeImage
+                                    src={plugin.logoUrl}
+                                    className="w-4 h-4 object-contain"
+                                    alt=""
+                                    fallback={
+                                      <Blocks size={14} aria-hidden="true" />
+                                    }
+                                  />
+                                  <span className="truncate">
+                                    {plugin.title}
+                                  </span>
+                                </span>
+                              </DropdownMenuCheckboxItem>
+                            );
+                          })}
+                        </>
+                      )}
                     </>
                   ) : (
                     <div
@@ -1716,7 +1742,6 @@ const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
                           ? t("disableSearchAria")
                           : t("enableSearchAria")
                     }
-                    aria-disabled={!searchCompatibility.enabled || undefined}
                     aria-pressed={
                       isSearchEnabled && searchCompatibility.enabled
                     }
@@ -1757,7 +1782,7 @@ const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
                       aria-label={t("selectModelAria", {
                         model: currentModelName,
                       })}
-                      className={`group inline-flex h-8 w-8 shrink-0 items-center justify-center gap-1.5 rounded-lg px-2 text-gray-500 transition-colors hover:bg-gray-100 hover:text-gray-700 md:w-auto md:max-w-52 dark:text-muted-foreground dark:hover:bg-accent/50 dark:hover:text-foreground ${iconButtonFocusClass}`}
+                      className={`group inline-flex h-10 w-10 shrink-0 items-center justify-center gap-1.5 rounded-lg px-2 text-gray-500 transition-colors hover:bg-gray-100 hover:text-gray-700 md:w-auto md:max-w-52 dark:text-muted-foreground dark:hover:bg-accent/50 dark:hover:text-foreground ${iconButtonFocusClass}`}
                       disabled={isInputBusy}
                     >
                       {/* Mobile: Just Icon */}
@@ -1942,12 +1967,6 @@ const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
                       aria-pressed={isRecording}
                       className={`${iconButtonBaseClass} transition-[background-color,color,box-shadow] ${iconButtonFocusClass} ${isRecording ? "bg-red-50 dark:bg-red-900/30 text-red-500 dark:text-red-400 ring-1 ring-red-200 dark:ring-red-800" : "text-gray-500 dark:text-muted-foreground hover:text-gray-700 dark:hover:text-foreground hover:bg-gray-100 dark:hover:bg-accent/50"}`}
                       onClick={toggleRecording}
-                      onContextMenu={(e) => {
-                        e.preventDefault();
-                        updateVoiceSettings({
-                          autoTranscribe: !voice.autoTranscribe,
-                        });
-                      }}
                     >
                       {isRecording ? (
                         <StopCircle size={16} aria-hidden="true" />

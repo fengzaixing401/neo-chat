@@ -210,6 +210,7 @@ describe("access password verification route", () => {
 
   it("keeps access failures server-side when the attempt cookie is cleared", async () => {
     vi.stubEnv("ACCESS_PASSWORD", "secret");
+    vi.stubEnv("TRUST_PROXY_HEADERS", "true");
     const { POST } = await import("../app/api/access/verify/route");
 
     const headers = { "x-forwarded-for": "203.0.113.44" };
@@ -249,14 +250,13 @@ describe("access password verification route", () => {
     expect(data.code).toBe(ACCESS_ERROR_CODES.locked);
   });
 
-  it("does not let spoofed forwarded IP headers bypass server-side access lockout", async () => {
+  it("does not globally lock unknown clients when proxy headers are untrusted", async () => {
     vi.stubEnv("ACCESS_PASSWORD", "secret");
     vi.stubEnv("TRUST_PROXY_HEADERS", "");
     const { POST } = await import("../app/api/access/verify/route");
 
-    let response: Response | null = null;
     for (const ip of ["203.0.113.44", "203.0.113.45", "203.0.113.46"]) {
-      response = await POST(
+      const response = await POST(
         new NextRequest("https://neo.test/api/access/verify", {
           method: "POST",
           headers: {
@@ -265,11 +265,21 @@ describe("access password verification route", () => {
           body: JSON.stringify({ password: "wrong" }),
         }),
       );
+      expect(response.status).toBe(401);
     }
 
-    const data = await response?.json();
-    expect(response?.status).toBe(423);
-    expect(data.code).toBe(ACCESS_ERROR_CODES.locked);
+    const response = await POST(
+      new NextRequest("https://neo.test/api/access/verify", {
+        method: "POST",
+        headers: {
+          "x-forwarded-for": "203.0.113.47",
+        },
+        body: JSON.stringify({ password: "secret" }),
+      }),
+    );
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ ok: true });
   });
 });
 
@@ -349,6 +359,47 @@ describe("access proxy", () => {
     expect(response.status).toBe(200);
   });
 
+  it("fails closed for production local API deployments without access control", async () => {
+    vi.stubEnv("NODE_ENV", "production");
+    vi.stubEnv("DEPLOYMENT_MODE", "local");
+    vi.stubEnv("ACCESS_PASSWORD", "");
+    vi.stubEnv("ALLOW_INSECURE_LOCAL_PRODUCTION", "");
+
+    const response = await applyRequestGuards(
+      new NextRequest("https://neo.test/api/search", {
+        method: "POST",
+        headers: {
+          origin: "https://neo.test",
+        },
+      }),
+    );
+    const data = await response?.json();
+
+    expect(response?.status).toBe(503);
+    expect(data).toMatchObject({
+      code: REQUEST_GUARD_ERROR_CODES.productionLocalOpen,
+      statusCode: 503,
+    });
+  });
+
+  it("allows explicit insecure local production opt-in for private deployments", async () => {
+    vi.stubEnv("NODE_ENV", "production");
+    vi.stubEnv("DEPLOYMENT_MODE", "local");
+    vi.stubEnv("ACCESS_PASSWORD", "");
+    vi.stubEnv("ALLOW_INSECURE_LOCAL_PRODUCTION", "true");
+
+    const response = await applyRequestGuards(
+      new NextRequest("https://neo.test/api/search", {
+        method: "POST",
+        headers: {
+          origin: "https://neo.test",
+        },
+      }),
+    );
+
+    expect(response).toBeNull();
+  });
+
   it("rate limits repeated access verification attempts server-side", async () => {
     vi.stubEnv("ACCESS_PASSWORD", "");
 
@@ -362,7 +413,7 @@ describe("access proxy", () => {
       }),
     );
 
-    for (let i = 0; i < 10; i += 1) {
+    for (let i = 0; i < 300; i += 1) {
       response = await proxy(
         new NextRequest("https://neo.test/api/access/verify", {
           method: "POST",
@@ -399,6 +450,7 @@ describe("access proxy", () => {
 
   it("rate limits high-cost GET API routes before route handling", async () => {
     vi.stubEnv("ACCESS_PASSWORD", "");
+    vi.stubEnv("TRUST_PROXY_HEADERS", "true");
 
     let response: Response | null = null;
     for (let i = 0; i < 16; i += 1) {
@@ -407,6 +459,55 @@ describe("access proxy", () => {
           method: "GET",
           headers: {
             "x-forwarded-for": "203.0.113.55",
+          },
+        }),
+      );
+    }
+
+    const data = await response?.json();
+    expect(response?.status).toBe(429);
+    expect(data).toMatchObject({
+      code: REQUEST_GUARD_ERROR_CODES.rateLimited,
+      statusCode: 429,
+    });
+  });
+
+  it("rate limits provider model POST requests with the high-cost provider rule", async () => {
+    vi.stubEnv("ACCESS_PASSWORD", "");
+    vi.stubEnv("TRUST_PROXY_HEADERS", "true");
+
+    let response: Response | null = null;
+    for (let i = 0; i < 31; i += 1) {
+      response = await applyRequestGuards(
+        new NextRequest("https://neo.test/api/providers/models", {
+          method: "POST",
+          headers: {
+            origin: "https://neo.test",
+            "x-forwarded-for": "203.0.113.56",
+          },
+        }),
+      );
+    }
+
+    const data = await response?.json();
+    expect(response?.status).toBe(429);
+    expect(data).toMatchObject({
+      code: REQUEST_GUARD_ERROR_CODES.rateLimited,
+      statusCode: 429,
+    });
+  });
+
+  it("rate limits MCP server registry GET requests before route handling", async () => {
+    vi.stubEnv("ACCESS_PASSWORD", "");
+    vi.stubEnv("TRUST_PROXY_HEADERS", "true");
+
+    let response: Response | null = null;
+    for (let i = 0; i < 31; i += 1) {
+      response = await applyRequestGuards(
+        new NextRequest("https://neo.test/api/mcp/servers?limit=1", {
+          method: "GET",
+          headers: {
+            "x-forwarded-for": "203.0.113.57",
           },
         }),
       );

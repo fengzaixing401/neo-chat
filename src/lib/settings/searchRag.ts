@@ -1,13 +1,14 @@
-import { RAG_LIMITS, SEARCH_CONFIG_LIMITS } from "../../config/limits";
+import { RAG_LIMITS, SEARCH_CONFIG_LIMITS } from "@/config/limits";
 import type {
   DocumentParseProvider,
   ProviderType,
   RAGConfig,
   SearchProviderID,
   SearchServiceConfig,
-} from "../../types";
+} from "@/types";
 import { isLocalEncryptedSecretEnvelope } from "../security/localSecrets";
 import { hasSearchApiKey } from "../security/localSecretResolvers";
+import { isGoogleProviderType } from "../providers/providerTypes";
 
 const SEARCH_PROVIDERS = [
   "default",
@@ -126,7 +127,7 @@ export const getSearchCompatibility = ({
   }
 
   if (searchProvider === "google") {
-    if (modelProviderType === "Gemini") {
+    if (isGoogleProviderType(modelProviderType)) {
       return {
         enabled: true,
         mode: "gemini-google",
@@ -193,9 +194,9 @@ export const getSearchCompatibilityErrorMessage = (
     case "missing_model_provider":
       return "No active model provider is available for search.";
     case "google_requires_gemini":
-      return "Google Search is only available with Gemini models. Choose an external search provider for OpenAI-compatible models.";
+      return "Google Search is only available with Google models. Choose an external search provider for this model.";
     case "model_builtin_search_unsupported":
-      return "Model built-in search is only available with Gemini or OpenAI Responses models. Choose an external search provider for OpenAI-compatible models.";
+      return "Model built-in search is only available with Google or OpenAI Responses models. Choose an external search provider for this model.";
     case "missing_search_api_key":
       return `${getSearchProviderLabel(result.provider)} search requires an API key.`;
     case "missing_search_base_url":

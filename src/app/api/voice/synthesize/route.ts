@@ -13,7 +13,10 @@ import {
   decryptSecretEnvelope,
   resolveProviderRuntimeConfig,
 } from "@/lib/byok/server";
-import { isOpenAIProviderType } from "@/lib/providers/providerTypes";
+import {
+  isGoogleProviderType,
+  isOpenAIProviderType,
+} from "@/lib/providers/providerTypes";
 import {
   getDefaultElevenLabsApiKey,
   getDefaultElevenLabsTtsModel,
@@ -28,11 +31,11 @@ import {
   base64ToBytes,
   bytesToArrayBuffer,
   createPcmWavBytes,
-} from "../../../../lib/utils/binary";
+} from "@/lib/utils/binary";
 import {
   DEFAULT_ELEVENLABS_TTS_MODEL,
   isElevenLabsTTSModel,
-} from "../../../../lib/utils/voiceModels";
+} from "@/lib/utils/voiceModels";
 
 const ELEVENLABS_API_URL = "https://api.elevenlabs.io/v1";
 const MIMO_CHAT_COMPLETIONS_URL =
@@ -268,7 +271,16 @@ export async function POST(request: NextRequest) {
         });
       }
 
-      const gemini = ProviderFactory.createGeminiClient(resolvedProvider);
+      if (!isGoogleProviderType(resolvedProvider.type)) {
+        return NextResponse.json(
+          {
+            error: `${resolvedProvider.type} does not support speech synthesis`,
+          },
+          { status: 400 },
+        );
+      }
+
+      const gemini = ProviderFactory.createGoogleClient(resolvedProvider);
       const response = await gemini.models.generateContent({
         model: modelId,
         contents: { parts: [{ text }] },

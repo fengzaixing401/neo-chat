@@ -3,22 +3,116 @@
  */
 
 import { GoogleGenAI } from "@google/genai";
+import Anthropic from "@anthropic-ai/sdk";
 import OpenAI from "openai";
 import { AuthenticationError } from "../errors";
 import {
+  getProviderAnthropicSdkBaseUrl,
   getProviderApiKey,
+  getProviderGoogleSdkOptions,
   normalizeProviderBaseUrl,
   ProviderRuntimeConfig,
   validateOutboundUrl,
   getSafeUrlPolicy,
 } from "../security/urlPolicy";
-import { assertOutboundUrlAllowed } from "../security/safeFetch";
-import { isOpenAIProviderType } from "./providerTypes";
+import { assertOutboundUrlAllowed, safeFetch } from "../security/safeFetch";
+import {
+  isAnthropicProviderType,
+  isGoogleProviderType,
+  isOpenAIProviderType,
+} from "./providerTypes";
 
 export type ProviderConfig = ProviderRuntimeConfig;
 
 export interface StreamSender {
   (data: any): void;
+}
+
+type ProviderFetch = typeof fetch;
+
+interface GoogleApiClientWithFetch {
+  apiClient?: {
+    apiCall?: (url: string, requestInit: RequestInit) => Promise<Response>;
+  };
+}
+
+const PROVIDER_TEXT_RESPONSE_LIMITS = {
+  timeoutMs: 30_000,
+  maxResponseBytes: 2 * 1024 * 1024,
+} as const;
+const PROVIDER_IMAGE_RESPONSE_LIMITS = {
+  timeoutMs: 120_000,
+  maxResponseBytes: 36 * 1024 * 1024,
+} as const;
+const PROVIDER_STREAM_RESPONSE_LIMITS = {
+  timeoutMs: 10 * 60_000,
+  maxResponseBytes: 8 * 1024 * 1024,
+} as const;
+
+export function getProviderResponseLimits(
+  input: RequestInfo | URL,
+  init?: RequestInit,
+) {
+  const url = input instanceof Request ? input.url : String(input);
+  const body = typeof init?.body === "string" ? init.body : "";
+  const isStreamingRequest =
+    /[?&]alt=sse(?:&|$)/i.test(url) ||
+    /:streamGenerateContent/i.test(url) ||
+    /"stream"\s*:\s*true/i.test(body);
+  if (isStreamingRequest) return PROVIDER_STREAM_RESPONSE_LIMITS;
+
+  const isImageRequest =
+    /\/images(?:\/|$)/i.test(url) ||
+    /"response_?modalities"\s*:\s*\[[^\]]*"IMAGE"/i.test(body) ||
+    /"type"\s*:\s*"image_generation"/i.test(body) ||
+    /"numberOfImages"\s*:/i.test(body);
+  if (isImageRequest) return PROVIDER_IMAGE_RESPONSE_LIMITS;
+  return PROVIDER_TEXT_RESPONSE_LIMITS;
+}
+
+function toSafeFetchRequest(
+  input: RequestInfo | URL,
+  init?: RequestInit,
+): { url: string | URL; init?: RequestInit } {
+  const request = input instanceof Request ? input : null;
+  if (!request) return { url: input as string | URL, init };
+
+  return {
+    url: request.url,
+    init: {
+      method: request.method,
+      headers: request.headers,
+      body: request.body,
+      signal: request.signal,
+      ...init,
+    },
+  };
+}
+
+function createProviderFetch(): ProviderFetch {
+  return async (input, init) => {
+    const request = toSafeFetchRequest(input, init);
+    const limits = getProviderResponseLimits(input, init);
+    return safeFetch(request.url, request.init, {
+      policy: getSafeUrlPolicy("provider"),
+      ...limits,
+      enforceResponseLimits: true,
+      countDecodedText: limits === PROVIDER_STREAM_RESPONSE_LIMITS,
+    });
+  };
+}
+
+function installGoogleProviderFetch(client: GoogleGenAI): GoogleGenAI {
+  const apiClient = (client as unknown as GoogleApiClientWithFetch).apiClient;
+  if (!apiClient?.apiCall) {
+    throw new Error(
+      "Google provider SDK does not expose the guarded fetch hook.",
+    );
+  }
+
+  const providerFetch = createProviderFetch();
+  apiClient.apiCall = (url, requestInit) => providerFetch(url, requestInit);
+  return client;
 }
 
 /**
@@ -52,6 +146,7 @@ export class ProviderFactory {
 
   static async assertProviderOutboundAllowed(
     provider: ProviderConfig,
+    signal?: AbortSignal,
   ): Promise<void> {
     const baseUrl = this.getEffectiveBaseUrl(provider.baseUrl, provider.type);
     if (!baseUrl) return;
@@ -59,6 +154,7 @@ export class ProviderFactory {
     await assertOutboundUrlAllowed(baseUrl, {
       policy: getSafeUrlPolicy("provider"),
       timeoutMs: 10_000,
+      signal,
     });
   }
 
@@ -67,36 +163,74 @@ export class ProviderFactory {
    */
   static createOpenAIClient(provider: ProviderConfig): OpenAI {
     const apiKey = this.validateApiKey(provider);
-    const baseURL = this.getEffectiveBaseUrl(provider.baseUrl, "OpenAI");
+    const baseURL = this.getEffectiveBaseUrl(provider.baseUrl, provider.type);
     if (baseURL) {
       validateOutboundUrl(baseURL, getSafeUrlPolicy("provider"));
     }
 
-    return new OpenAI({ apiKey, baseURL });
+    return new OpenAI({
+      apiKey,
+      baseURL,
+      fetch: createProviderFetch(),
+      maxRetries: 0,
+    });
   }
 
   /**
-   * 创建 Gemini 客户端
+   * 创建 Anthropic 客户端
    */
-  static createGeminiClient(provider: ProviderConfig): GoogleGenAI {
+  static createAnthropicClient(provider: ProviderConfig): Anthropic {
     const apiKey = this.validateApiKey(provider);
-    const baseUrl = this.getEffectiveBaseUrl(provider.baseUrl, "Gemini");
+    const baseURL = getProviderAnthropicSdkBaseUrl(provider.baseUrl);
+    validateOutboundUrl(baseURL, getSafeUrlPolicy("provider"));
+
+    return new Anthropic({
+      apiKey,
+      baseURL,
+      fetch: createProviderFetch(),
+      maxRetries: 0,
+    });
+  }
+
+  /**
+   * 创建 Google 客户端
+   */
+  static createGoogleClient(provider: ProviderConfig): GoogleGenAI {
+    const apiKey = this.validateApiKey(provider);
+    const { baseUrl, apiVersion } = getProviderGoogleSdkOptions(
+      provider.baseUrl,
+    );
     if (baseUrl) {
       validateOutboundUrl(baseUrl, getSafeUrlPolicy("provider"));
     }
 
-    return new GoogleGenAI({
-      apiKey,
-      httpOptions: { baseUrl },
-    });
+    return installGoogleProviderFetch(
+      new GoogleGenAI({
+        apiKey,
+        httpOptions: { baseUrl, apiVersion },
+      }),
+    );
+  }
+
+  static createGeminiClient(provider: ProviderConfig): GoogleGenAI {
+    return this.createGoogleClient(provider);
   }
 
   /**
    * 创建客户端（自动选择类型）
    */
-  static createClient(provider: ProviderConfig): OpenAI | GoogleGenAI {
-    return isOpenAIProviderType(provider.type)
-      ? this.createOpenAIClient(provider)
-      : this.createGeminiClient(provider);
+  static createClient(
+    provider: ProviderConfig,
+  ): OpenAI | Anthropic | GoogleGenAI {
+    if (isOpenAIProviderType(provider.type)) {
+      return this.createOpenAIClient(provider);
+    }
+    if (isAnthropicProviderType(provider.type)) {
+      return this.createAnthropicClient(provider);
+    }
+    if (isGoogleProviderType(provider.type)) {
+      return this.createGoogleClient(provider);
+    }
+    throw new Error(`Unsupported provider type: ${provider.type}`);
   }
 }

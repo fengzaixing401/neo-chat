@@ -1,16 +1,16 @@
 import { LobeAgent } from "@/types";
 import { useSettingsStore } from "@/store/core/settingsStore";
-import { readJsonResponseOrThrow } from "../../lib/api/client";
+import { readJsonResponseOrThrow, signedApiFetch } from "@/lib/api/client";
 import {
   normalizeAgentDetail,
   normalizeMarketAgents,
-} from "../../lib/market/agents";
+} from "@/lib/market/agents";
 import {
   normalizeAgentMarketLocale,
   type AgentMarketLocale,
-} from "../../lib/market/agentLocale";
-import { logDevError, logDevInfo, logDevWarn } from "../../lib/utils/devLogger";
-import { CACHE_CONFIG } from "../../config/api";
+} from "@/lib/market/agentLocale";
+import { logDevError, logDevInfo, logDevWarn } from "@/lib/utils/devLogger";
+import { CACHE_CONFIG } from "@/config/api";
 
 const CACHE_DURATION = CACHE_CONFIG.agents;
 
@@ -98,7 +98,7 @@ export const getAgents = async (
 
   const request = (async () => {
     logDevInfo("Fetching agents from API...");
-    const response = await fetch(`/api/agents?locale=${locale}`);
+    const response = await signedApiFetch(`/api/agents?locale=${locale}`);
     if (!response.ok) throw new Error("Failed to fetch agents");
 
     const data = await readJsonResponseOrThrow<AgentListResponse>(
@@ -151,7 +151,7 @@ export const getAgentDetail = async (
 ): Promise<any> => {
   const locale = normalizeAgentMarketLocale(requestedLocale);
   try {
-    const response = await fetch(
+    const response = await signedApiFetch(
       `/api/agents/${encodeURIComponent(identifier)}?locale=${locale}`,
     );
     if (!response.ok) throw new Error("Failed to fetch agent details");

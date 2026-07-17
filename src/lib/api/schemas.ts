@@ -8,10 +8,11 @@ import {
   getAttachmentPayloadBytes,
   getAttachmentsPayloadChars,
   getRuntimeMaxAttachmentFileBytes,
-} from "../../config/limits";
+} from "@/config/limits";
 import { getRemoteAttachmentUrlError } from "../security/remoteAttachment";
 import { getPluginExecutionArgsError } from "../plugin/execution";
 import { BYOK_ALG } from "../byok/shared";
+import { normalizeProviderType } from "../providers/providerTypes";
 
 const Base64UrlStringSchema = z.string().regex(/^[A-Za-z0-9_-]+$/);
 
@@ -51,7 +52,13 @@ function omitPlainSecretField<
 
 export const ProviderRuntimeConfigSchema = z
   .object({
-    type: z.enum(["OpenAI", "Gemini", "OpenAI Compatible"]),
+    type: z.enum([
+      "OpenAI Compatible",
+      "OpenAI",
+      "Anthropic",
+      "Google",
+      "Gemini",
+    ]),
     source: z.literal("server-default").optional(),
     apiKey: z.unknown().optional(),
     apiKeySecret: EncryptedSecretEnvelopeSchema.optional(),
@@ -67,7 +74,10 @@ export const ProviderRuntimeConfigSchema = z
       "Provider API key",
     );
   })
-  .transform((provider) => omitPlainSecretField(provider, "apiKey"));
+  .transform((provider) => ({
+    ...omitPlainSecretField(provider, "apiKey"),
+    type: normalizeProviderType(provider.type),
+  }));
 
 const JsonLikeSchema: z.ZodType<unknown> = z.lazy(() =>
   z.union([
@@ -119,7 +129,15 @@ export const ToolCallSchema = z
     name: z.string().min(1).max(128),
     args: z.record(z.string(), JsonLikeSchema).default({}),
     status: z
-      .enum(["pending", "running", "success", "error", "skipped"])
+      .enum([
+        "pending",
+        "awaiting_confirmation",
+        "running",
+        "success",
+        "error",
+        "skipped",
+        "denied",
+      ])
       .optional(),
     result: JsonLikeSchema.optional(),
     isError: z.boolean().optional(),
@@ -134,6 +152,12 @@ export const ToolCallSchema = z
           ? "success"
           : "pending"),
   }));
+
+const MessageMemoryContextSchema = z.object({
+  injectedMemoryIds: z.array(z.string().min(1).max(160)).max(100).default([]),
+  promptContext: z.string().min(1).max(8_000),
+  createdAt: z.number().optional(),
+});
 
 export const SkillInvocationSchema = z
   .object({
@@ -161,6 +185,7 @@ export const MessageSchema = z.object({
     .max(PLUGIN_EXECUTION_LIMITS.maxStreamedToolCalls)
     .optional(),
   skillInvocations: z.array(SkillInvocationSchema).max(20).optional(),
+  memoryContext: MessageMemoryContextSchema.optional(),
   model: ModelNameSchema.optional(),
 });
 
@@ -286,12 +311,30 @@ const PluginFunctionSchema = z
       .regex(/^[A-Za-z0-9_-]+$/),
     description: z.string().max(2_048).optional(),
     parameters: FunctionParametersSchema.optional(),
-    path: z.string().min(1).max(1_024),
+    path: z.string().min(1).max(1_024).optional(),
     method: z
       .enum(["GET", "POST", "PUT", "PATCH", "DELETE"])
-      .or(z.enum(["get", "post", "put", "patch", "delete"])),
+      .or(z.enum(["get", "post", "put", "patch", "delete"]))
+      .optional(),
+    mcpToolName: z.string().min(1).max(256).optional(),
+    risk: z.enum(["read", "write", "destructive", "external"]).optional(),
   })
-  .strict();
+  .strict()
+  .superRefine((functionDef, ctx) => {
+    if (functionDef.mcpToolName) return;
+    if (functionDef.path && functionDef.method) return;
+
+    ctx.addIssue({
+      code: "custom",
+      message:
+        "Plugin function must declare either REST path/method or mcpToolName",
+    });
+  });
+
+const PluginHeaderMapSchema = z.record(
+  z.string().min(1).max(120),
+  z.string().max(4_096),
+);
 
 const PluginSchema = z
   .object({
@@ -306,6 +349,18 @@ const PluginSchema = z
     categories: z.array(z.string().max(120)).max(20).optional(),
     added: z.string().max(120).optional(),
     functions: z.array(PluginFunctionSchema).max(40).optional(),
+    source: z.enum(["builtin", "openapi", "mcp"]).optional(),
+    mcp: z
+      .object({
+        transport: z.literal("streamable-http"),
+        serverUrl: z.string().min(1).max(2_048),
+        serverName: z.string().min(1).max(300),
+        serverVersion: z.string().max(120).optional(),
+        headers: PluginHeaderMapSchema.optional(),
+        toolNameMap: z.record(z.string(), z.string()).optional(),
+      })
+      .strict()
+      .optional(),
     builtIn: z.boolean().optional(),
     auth: z
       .object({
@@ -383,6 +438,7 @@ export const PluginInstallSchema = z
   .object({
     plugin: PluginSchema.partial().optional(),
     customInput: z.string().max(2_000_000).optional(),
+    authConfig: PluginAuthConfigSchema,
   })
   .strict();
 
@@ -417,6 +473,12 @@ export const SearchRequestSchema = z
       .transform((config) => omitPlainSecretField(config, "apiKey"))
       .optional(),
     maxResult: z.coerce.number().int().min(1).max(10).optional(),
+  })
+  .strict();
+
+export const MessageImageProxyRequestSchema = z
+  .object({
+    url: z.string().max(2_048).url(),
   })
   .strict();
 

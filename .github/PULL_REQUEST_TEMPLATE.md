@@ -4,11 +4,17 @@
 
 ## Test Plan
 
+- [ ] `pnpm check:imports`
 - [ ] `pnpm format:check`
+- [ ] `pnpm hygiene:artifacts`
 - [ ] `pnpm lint`
 - [ ] `pnpm typecheck`
 - [ ] `pnpm test`
 - [ ] `pnpm build`
+- [ ] `pnpm build:worker`
+- [ ] `pnpm worker:size`
+- [ ] `pnpm worker:dry-run`
+- [ ] `pnpm audit --prod --audit-level moderate`
 
 ## Notes
 

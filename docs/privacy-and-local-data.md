@@ -21,7 +21,12 @@ Generated images from native image models are saved as message output data in
 IndexedDB with the rest of the chat message. When users export app data, those
 image output blocks are included in the exported conversation payload. PNG/PDF
 message exports render the visible output blocks, while full app export
-preserves the stored message data.
+preserves every stored session message tree, including trees not referenced by
+the current chat metadata. If any message tree cannot be read, the export fails
+instead of returning partial data. Full app export is a metadata JSON export:
+it preserves `opfs://` references as stored, but does not read, copy, or
+validate OPFS blobs. Missing OPFS files do not block the export, and runtime
+`blob:` URLs are not included.
 
 Image attachments keep their original `data` or remote `url` as the canonical
 message data. OPFS image copies are display caches mapped from that original
@@ -68,6 +73,12 @@ plugin requests, and BYOK envelopes. Local memory tool results may also be
 present in model request context. Deployments should treat server logs,
 observability tools, and hosting provider logs as sensitive.
 
+Remote MCP calls send model-generated tool arguments, including any context the
+tool arguments contain, to the configured MCP server. MCP tool results return
+through the plugin execution route and may be included in a subsequent model
+request. Treat every MCP server as a third-party service with its own logging,
+retention, and external side-effect behavior.
+
 Neo Chat validates request payloads, applies URL safety gates, limits response
 sizes, and uses hosted-mode restrictions, but upstream providers still receive
 the content required to complete user-requested actions.
@@ -76,11 +87,13 @@ the content required to complete user-requested actions.
 
 Depending on configuration, user content may be sent to:
 
-- Model providers such as Gemini, OpenAI, or OpenAI-compatible endpoints.
+- Model providers such as Google, Anthropic, OpenAI, or OpenAI-compatible endpoints.
 - Search providers such as Tavily, Firecrawl, Exa, Bocha, or SearXNG.
 - RAG/vector services and document parsers such as Mineru or LlamaParse.
 - Voice providers such as ElevenLabs or Mimo.
 - Plugin APIs enabled by the user.
+- Remote MCP servers installed from the Registry or configured through a custom
+  HTTPS endpoint.
 
 Text-only skills themselves are local prompt instructions, but applied skill
 content can be sent to the selected model provider as part of the prompt.

@@ -7,11 +7,11 @@ import type {
   Message,
   ModelProvider,
   Session,
-} from "../../types";
-import { DEFAULT_CHAT_CONFIG } from "../../config/defaults";
-import { normalizeProviderModelId } from "../../lib/providers/models";
-import { normalizeChatConfig } from "../../lib/settings/appConfig";
-import { normalizeSession } from "../../lib/chat/entities";
+} from "@/types";
+import { DEFAULT_CHAT_CONFIG } from "@/config/defaults";
+import { normalizeProviderModelId } from "@/lib/providers/models";
+import { normalizeChatConfig } from "@/lib/settings/appConfig";
+import { normalizeSession } from "@/lib/chat/entities";
 import { normalizeMessages } from "./migrations";
 
 type BrowserStorage = Pick<Storage, "getItem" | "setItem" | "removeItem">;
@@ -234,7 +234,7 @@ export function buildLegacyGeminiProvider(
   return {
     id: GEMINI_PROVIDER_ID,
     name: "Google Gemini",
-    type: "Gemini",
+    type: "Google",
     baseUrl: stringValue(legacySetting.apiProxy) || GEMINI_BASE_URL,
     apiKey: stringValue(legacySetting.apiKey),
     enabled: true,
@@ -270,7 +270,7 @@ function mergeGeminiProvider(
 
     return {
       ...provider,
-      type: "Gemini" as const,
+      type: "Google" as const,
       name: provider.name || legacyProvider.name,
       baseUrl: provider.baseUrl || legacyProvider.baseUrl,
       apiKey: provider.apiKey || legacyProvider.apiKey,

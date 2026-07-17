@@ -17,11 +17,11 @@ import {
   normalizeModelProviders,
 } from "@/lib/providers/config";
 import { OPENAI_COMPATIBLE_PROVIDER_TYPE } from "@/lib/providers/providerTypes";
-import { logDevError } from "../../lib/utils/devLogger";
+import { logDevError } from "@/lib/utils/devLogger";
 import {
   migrateProviderLocalSecret,
   stripProviderPlainSecret,
-} from "../../lib/settings/localSecretMigration";
+} from "@/lib/settings/localSecretMigration";
 
 /**
  * Core Settings Store
@@ -41,7 +41,7 @@ const EMPTY_DEFAULT_MODELS: DefaultModels = {
 const LEGACY_GEMINI_PROVIDER = {
   id: "GEMINI",
   name: "Google Gemini",
-  type: "Gemini",
+  type: "Google",
   baseUrl: "https://generativelanguage.googleapis.com",
 };
 

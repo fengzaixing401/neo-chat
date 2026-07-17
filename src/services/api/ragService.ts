@@ -1,19 +1,19 @@
 import { useSettingsStore } from "@/store/core/settingsStore";
-import type { Source } from "../../types";
-import { RAG_LIMITS } from "../../config/limits";
+import type { Source } from "@/types";
+import { RAG_LIMITS } from "@/config/limits";
 import {
   getResponseErrorMessage,
   readJsonResponseOrThrow,
   signedApiFetch,
-} from "../../lib/api/client";
-import { normalizeSearchSources } from "../../lib/search/results";
-import { BYOK_CONTEXTS } from "../../lib/byok/shared";
-import { encryptSecret, fetchWithByokRetry } from "../../lib/byok/client";
-import { logDevError } from "../../lib/utils/devLogger";
+} from "@/lib/api/client";
+import { normalizeSearchSources } from "@/lib/search/results";
+import { BYOK_CONTEXTS } from "@/lib/byok/shared";
+import { encryptSecret, fetchWithByokRetry } from "@/lib/byok/client";
+import { logDevError } from "@/lib/utils/devLogger";
 import {
   hasRagVectorStore,
   resolveRagToken,
-} from "../../lib/security/localSecretResolvers";
+} from "@/lib/security/localSecretResolvers";
 
 function chunkArray<T>(items: T[], size: number): T[][] {
   const chunks: T[][] = [];
@@ -28,6 +28,7 @@ function chunkArray<T>(items: T[], size: number): T[][] {
 export async function queryRAG(
   text: string,
   namespace = "",
+  signal?: AbortSignal,
 ): Promise<Source[]> {
   const { rag } = useSettingsStore.getState();
 
@@ -43,7 +44,7 @@ export async function queryRAG(
       const token = useDefault ? undefined : await resolveRagToken(rag);
       const tokenSecret = useDefault
         ? undefined
-        : await encryptSecret(token, BYOK_CONTEXTS.ragToken);
+        : await encryptSecret(token, BYOK_CONTEXTS.ragToken, signal);
       return signedApiFetch("/api/rag/query", {
         method: "POST",
         headers: {
@@ -57,6 +58,7 @@ export async function queryRAG(
           tokenSecret,
           topK: rag.topK || 10,
         }),
+        signal,
       });
     });
 
@@ -75,6 +77,9 @@ export async function queryRAG(
       maxSources: rag.topK || 10,
     });
   } catch (e) {
+    if (signal?.aborted || (e instanceof Error && e.name === "AbortError")) {
+      throw e;
+    }
     logDevError("RAG Query Failed:", e);
     throw e;
   }

@@ -5,8 +5,8 @@ import {
   SEARCH_CONFIG_LIMITS,
   SYSTEM_SETTINGS_LIMITS,
   getRuntimeMaxAttachmentFileBytes,
-} from "../../config/limits";
-import { DEFAULT_SYSTEM_SETTINGS } from "../../config/defaults";
+} from "@/config/limits";
+import { DEFAULT_SYSTEM_SETTINGS } from "@/config/defaults";
 import { normalizeProviderModelId } from "../providers/models";
 import { normalizeSystemSettings } from "../settings/appConfig";
 import type {
@@ -19,13 +19,13 @@ import type {
   ServerDefaultVoiceProvider,
   SystemSettings,
   VoiceSettings,
-} from "../../types";
+} from "@/types";
 import {
   PublicServerConfig,
   PublicDeploymentStoreState,
   SERVER_DEFAULT_PROVIDER_ID,
 } from "./shared";
-import { isProviderType } from "../providers/providerTypes";
+import { normalizeProviderTypeValue } from "../providers/providerTypes";
 import { normalizeModelMetadata } from "../providers/metadata";
 import { getDeploymentMode } from "../security/deployment";
 import {
@@ -259,8 +259,7 @@ function clampInteger(
 
 function getDefaultProviderType(): ProviderType {
   const configured = env("DEFAULT_PROVIDER_TYPE");
-  if (isProviderType(configured)) return configured;
-  return "Gemini";
+  return normalizeProviderTypeValue(configured) || "Google";
 }
 
 export function getDefaultProviderApiKey(): string {

@@ -10,7 +10,7 @@ import type {
   Session,
   SystemPersonality,
   Workspace,
-} from "../../types";
+} from "@/types";
 import type { SkillCatalogEntry } from "../skills/types";
 import {
   isPluginAuthRequired,
@@ -243,7 +243,7 @@ export function resolveEffectiveChatContext(
     modelMetadata,
     customModelMetadata,
   });
-  const requestedPluginIds = session?.config?.activePlugins || activePlugins;
+  const requestedPluginIds = activePlugins;
   const activePluginIds = normalizeActivePluginIds(
     requestedPluginIds,
     installedPlugins,

@@ -7,17 +7,10 @@ import React, {
   useCallback,
 } from "react";
 import { useLocale, useTranslations } from "next-intl";
-import dynamic from "next/dynamic";
-import { MessageSquarePlus, PanelLeftClose, PanelLeftOpen } from "lucide-react";
 import { v7 as uuidv7 } from "uuid";
 
-import Sidebar from "@/components/layout/Sidebar";
-import MessageItem from "@/components/chat/MessageItem";
-import MessageInput, { MessageInputRef } from "@/components/chat/MessageInput";
-import AssistantHeader from "@/components/assistant/AssistantHeader";
-import Tooltip from "@/components/ui/Tooltip";
-import FollowUpQuestions from "@/components/chat/FollowUpQuestions";
-import { Logo } from "@/components/ui/Icons";
+import ChatAppShell from "@/components/app/ChatAppShell";
+import type { MessageInputRef } from "@/components/chat/MessageInput";
 import type { ModelInfo } from "@/services/api/chatService";
 import { resolveSkillsForMessage } from "@/services/api/skillService";
 import {
@@ -47,16 +40,19 @@ import {
 } from "@/lib/chat/postGenerationGuards";
 import {
   useChatGenerationController,
+  useChatPanelNavigation,
   useChatShellState,
   useChatThemeEffects,
+  useWelcomeChatState,
+  useWorkspaceAttachmentHydration,
 } from "@/features/chat";
 import { resolveEffectiveChatContext } from "@/lib/chat/effectiveChatContext";
 import { resolveEffectiveChatRequestConfig } from "@/lib/chat/effectiveChatConfig";
 import { buildDirectMemoryPromptContext } from "@/lib/memory/entities";
+import { getSuppressedMemoryIds } from "@/lib/memory/compression";
 import { appendContextToChatInput } from "@/lib/utils/chatInput";
 import {
   getActiveMessagePath,
-  getMessageBranchInfo,
   normalizeSessionMessageTree,
 } from "@/lib/chat/messageTree";
 import { normalizeActivePluginIds } from "@/lib/plugin/config";
@@ -73,45 +69,13 @@ import {
 } from "@/lib/api/client";
 import {
   getSessionPluginPresetSyncKey,
+  shouldDisableSearchToggle,
   shouldApplySessionPluginPreset,
   shouldResolveSelectedModelAfterBootstrap,
   shouldRunSettingsStartupEffects,
 } from "@/lib/app/startupEffects";
-import {
-  ChatPanel,
-  SettingsTabId,
-  parseChatPanelUrlState,
-  setChatPanelUrlState,
-} from "@/lib/chat/panelUrlState";
 import { buildSearchUpdate } from "@/lib/chat/searchUpdate";
-
-const ImagePreview = dynamic(() => import("@/components/media/ImagePreview"), {
-  ssr: false,
-});
-const PluginMarket = dynamic(() => import("@/components/plugin/PluginMarket"), {
-  ssr: false,
-});
-const SkillMarket = dynamic(() => import("@/components/skill/SkillMarket"), {
-  ssr: false,
-});
-const AssistantHub = dynamic(
-  () => import("@/components/assistant/AssistantHub"),
-  {
-    ssr: false,
-  },
-);
-const KnowledgeBase = dynamic(
-  () => import("@/components/knowledge/KnowledgeBase"),
-  {
-    ssr: false,
-  },
-);
-const SettingsPage = dynamic(
-  () => import("@/components/settings/SettingsPage"),
-  {
-    ssr: false,
-  },
-);
+import { getSearchCompatibility } from "@/lib/settings/searchRag";
 
 const logChatAppError = logDevError;
 const EMPTY_MESSAGES: Message[] = [];
@@ -127,6 +91,8 @@ const ChatApp = () => {
       currentSessionId,
       activeMessages,
       activeMessageTree,
+      isActiveSessionLoading,
+      activeSessionLoadError,
       selectedModel,
       chatConfig,
       createSession,
@@ -183,8 +149,6 @@ const ChatApp = () => {
   const locale = useLocale();
 
   // --- Local UI State ---
-  const [isSidebarOpen, setIsSidebarOpen] = useState(false);
-  const [isNonDesktopViewport, setIsNonDesktopViewport] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const {
     isGenerating,
@@ -193,12 +157,38 @@ const ChatApp = () => {
     finishActiveGeneration,
     stopActiveGeneration,
   } = useChatGenerationController();
+  const {
+    viewMode,
+    settingsTab,
+    isSidebarOpen,
+    isNonDesktopViewport,
+    isSidebarDrawerOpen,
+    mainInertProps,
+    setIsSidebarOpen,
+    navigateToPanel,
+    handleSettingsTabChange,
+  } = useChatPanelNavigation();
+
+  const backgroundPostProcessControllerRef = useRef<AbortController | null>(
+    null,
+  );
+  const abortBackgroundPostProcessing = useCallback(() => {
+    backgroundPostProcessControllerRef.current?.abort();
+    backgroundPostProcessControllerRef.current = null;
+  }, []);
+  const beginBackgroundPostProcessing = useCallback(() => {
+    abortBackgroundPostProcessing();
+    const controller = new AbortController();
+    backgroundPostProcessControllerRef.current = controller;
+    return controller.signal;
+  }, [abortBackgroundPostProcessing]);
 
   const queueMemoryExtraction = useCallback(
     (
       sessionId: string,
       userMessage: Pick<Message, "id" | "content">,
       assistantMessage: Pick<Message, "id" | "content">,
+      signal?: AbortSignal,
     ) => {
       loadChatService()
         .then(({ performBackgroundMemoryExtraction }) =>
@@ -206,17 +196,21 @@ const ChatApp = () => {
             sessionId,
             userMessage,
             assistantMessage,
+            signal,
           }),
         )
         .catch((err) => {
+          if (
+            signal?.aborted ||
+            (err instanceof Error && err.name === "AbortError")
+          ) {
+            return;
+          }
           logChatAppError("Memory extraction failed:", err);
         });
     },
     [],
   );
-
-  const [viewMode, setViewMode] = useState<ChatPanel>("chat");
-  const [settingsTab, setSettingsTab] = useState<SettingsTabId>("providers");
 
   const [serverConfigResolved, setServerConfigResolved] = useState(false);
   const [serverModelBootstrapReady, setServerModelBootstrapReady] =
@@ -253,168 +247,34 @@ const ChatApp = () => {
   const messages = activeMessages ?? EMPTY_MESSAGES; // Use activeMessages from store
   const currentSessionConfig = currentSession?.config;
   const currentSessionWorkspaceId = currentSession?.workspaceId;
+  const selectedProvider = useMemo(() => {
+    const { providerId } = parseModelString(selectedModel);
+    return providerId
+      ? providers.find((provider) => provider.id === providerId)
+      : providers.find((provider) => provider.enabled);
+  }, [providers, selectedModel]);
+  const currentSearchCompatibility = useMemo(() => {
+    const searchConfig =
+      search.provider === "google"
+        ? undefined
+        : search.configs[search.provider];
+    return getSearchCompatibility({
+      searchProvider: search.provider,
+      searchConfig,
+      modelProviderType: selectedProvider?.type,
+    });
+  }, [search.configs, search.provider, selectedProvider?.type]);
   useChatThemeEffects(theme, system.fontSize);
-
-  const updateBrowserSearch = useCallback(
-    (params: URLSearchParams, historyMode: "push" | "replace") => {
-      if (typeof window === "undefined") return;
-
-      const search = params.toString();
-      const nextUrl = `${window.location.pathname}${
-        search ? `?${search}` : ""
-      }${window.location.hash}`;
-      const currentUrl = `${window.location.pathname}${window.location.search}${window.location.hash}`;
-      if (nextUrl === currentUrl) return;
-
-      if (historyMode === "replace") {
-        window.history.replaceState(null, "", nextUrl);
-      } else {
-        window.history.pushState(null, "", nextUrl);
-      }
-    },
-    [],
-  );
-
-  const updatePanelUrl = useCallback(
-    (
-      panel: ChatPanel,
-      nextSettingsTab?: SettingsTabId | null,
-      historyMode: "push" | "replace" = "push",
-    ) => {
-      if (typeof window === "undefined") return;
-
-      const nextParams = setChatPanelUrlState(
-        new URLSearchParams(window.location.search),
-        { panel, settingsTab: nextSettingsTab },
-      );
-      updateBrowserSearch(nextParams, historyMode);
-    },
-    [updateBrowserSearch],
-  );
-
-  const navigateToPanel = useCallback(
-    (
-      panel: ChatPanel,
-      nextSettingsTab?: SettingsTabId | null,
-      historyMode: "push" | "replace" = "push",
-    ) => {
-      const resolvedSettingsTab =
-        panel === "settings" ? (nextSettingsTab ?? settingsTab) : null;
-
-      setViewMode(panel);
-      if (resolvedSettingsTab) {
-        setSettingsTab(resolvedSettingsTab);
-      }
-      updatePanelUrl(panel, resolvedSettingsTab, historyMode);
-      if (isNonDesktopViewport) {
-        setIsSidebarOpen(false);
-      }
-    },
-    [isNonDesktopViewport, settingsTab, updatePanelUrl],
-  );
-
-  const handleSettingsTabChange = useCallback(
-    (tab: SettingsTabId) => {
-      setSettingsTab(tab);
-      if (viewMode === "settings") {
-        updatePanelUrl("settings", tab);
-      }
-    },
-    [updatePanelUrl, viewMode],
-  );
-
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-
-    const syncPanelFromUrl = () => {
-      const parsed = parseChatPanelUrlState(
-        new URLSearchParams(window.location.search),
-      );
-      setViewMode(parsed.panel);
-      setSettingsTab(parsed.settingsTab ?? "providers");
-      if (parsed.needsReplace) {
-        updateBrowserSearch(parsed.normalizedSearchParams, "replace");
-      }
-    };
-
-    syncPanelFromUrl();
-    window.addEventListener("popstate", syncPanelFromUrl);
-    return () => window.removeEventListener("popstate", syncPanelFromUrl);
-  }, [updateBrowserSearch]);
-
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-
-    const updateViewport = () => {
-      setIsNonDesktopViewport(window.innerWidth < 1024);
-    };
-
-    updateViewport();
-    window.addEventListener("resize", updateViewport);
-    return () => window.removeEventListener("resize", updateViewport);
-  }, []);
-
-  const isSidebarDrawerOpen = isSidebarOpen && isNonDesktopViewport;
-
-  useEffect(() => {
-    if (!isSidebarDrawerOpen) return;
-
-    const previousOverflow = document.body.style.overflow;
-    document.body.style.overflow = "hidden";
-
-    return () => {
-      document.body.style.overflow = previousOverflow;
-    };
-  }, [isSidebarDrawerOpen]);
-
-  const mainInertProps = useMemo<
-    React.HTMLAttributes<HTMLElement> & { inert?: boolean }
-  >(
-    () => (isSidebarDrawerOpen ? { inert: true, "aria-hidden": true } : {}),
-    [isSidebarDrawerOpen],
-  );
 
   // Logic for Assistant List Animation
   const isChatEmpty =
     messages.length === 0 && !currentSession?.systemInstruction;
-  const [welcomeState, setWelcomeState] = useState<
-    "visible" | "exiting" | "hidden"
-  >("hidden");
-  const messageInputVariant = welcomeState === "visible" ? "hero" : "default";
-  const shouldShowChatTitleBar = welcomeState === "hidden";
-  const prevSessionIdRef = useRef(currentSessionId);
-  const inputSessionRef = useRef(currentSessionId);
-  const workspaceAttachmentHydratedSessionRef = useRef<string | null>(null);
+  const { welcomeState, messageInputVariant, shouldShowChatTitleBar } =
+    useWelcomeChatState({
+      currentSessionId,
+      isChatEmpty,
+    });
   const syncedSessionPluginPresetRef = useRef<string | null>(null);
-
-  // Sync welcomeState with chat emptiness, handling animations only within the same session
-  useEffect(() => {
-    // If session ID changed, snap to correct state immediately (no animation)
-    if (prevSessionIdRef.current !== currentSessionId) {
-      setWelcomeState(isChatEmpty ? "visible" : "hidden");
-      prevSessionIdRef.current = currentSessionId;
-      return;
-    }
-
-    // Same session transitions
-    if (!isChatEmpty && welcomeState === "visible") {
-      // Messages appeared -> animate out
-      setWelcomeState("exiting");
-    } else if (isChatEmpty && welcomeState !== "visible") {
-      // Chat cleared -> snap back (or animate in? standard is snap for clear)
-      setWelcomeState("visible");
-    }
-  }, [currentSessionId, isChatEmpty, welcomeState]);
-
-  // Handle Exiting Timer
-  useEffect(() => {
-    if (welcomeState === "exiting") {
-      const timer = setTimeout(() => {
-        setWelcomeState("hidden");
-      }, 300); // Duration matches CSS transition
-      return () => clearTimeout(timer);
-    }
-  }, [welcomeState]);
 
   // --- Effects ---
 
@@ -462,44 +322,42 @@ const ChatApp = () => {
     setActivePlugins,
   ]);
 
-  // Hydrate workspace preset files once when entering an empty workspace chat.
-  useEffect(() => {
-    const inputSessionChanged = inputSessionRef.current !== currentSessionId;
-    if (inputSessionChanged) {
-      inputSessionRef.current = currentSessionId;
-      workspaceAttachmentHydratedSessionRef.current = null;
-    }
-
-    const input = messageInputRef.current;
-    if (!input) return;
-
-    if (!currentSessionId || activeMessages.length > 0) {
-      workspaceAttachmentHydratedSessionRef.current = null;
-      if (inputSessionChanged) {
-        input.setAttachments([]);
-      }
-      return;
-    }
-
-    if (workspaceAttachmentHydratedSessionRef.current === currentSessionId) {
-      return;
-    }
-
-    const workspaceFiles = currentSessionWorkspaceId
-      ? workspaces.find(
-          (workspace) => workspace.id === currentSessionWorkspaceId,
-        )?.files || []
-      : [];
-    input.setAttachments(workspaceFiles);
-    workspaceAttachmentHydratedSessionRef.current = currentSessionId;
-  }, [
-    activeMessages.length,
+  useWorkspaceAttachmentHydration({
+    activeMessagesLength: activeMessages.length,
     currentSessionId,
     currentSessionWorkspaceId,
+    inputRef: messageInputRef,
     workspaces,
-  ]);
+  });
 
   // Fetch Metadata & Ensure Plugins on mount
+  useEffect(() => {
+    if (
+      !shouldDisableSearchToggle({
+        chatHydrated: chatHasHydrated,
+        settingsHydrated: _hasHydrated,
+        coreHydrated: coreHasHydrated,
+        serverModelBootstrapReady,
+        useSearch: chatConfig.useSearch,
+        searchCompatibility: currentSearchCompatibility,
+      })
+    ) {
+      return;
+    }
+
+    if (!currentSearchCompatibility.enabled) {
+      setChatConfig({ useSearch: false });
+    }
+  }, [
+    chatConfig.useSearch,
+    chatHasHydrated,
+    _hasHydrated,
+    coreHasHydrated,
+    currentSearchCompatibility,
+    serverModelBootstrapReady,
+    setChatConfig,
+  ]);
+
   useEffect(() => {
     if (!shouldRunSettingsStartupEffects(_hasHydrated)) return;
     fetchModelMetadata();
@@ -674,22 +532,21 @@ const ChatApp = () => {
     setModel,
   ]);
 
-  // Check screen size on mount
-  useEffect(() => {
-    if (typeof window !== "undefined" && window.innerWidth > 768) {
-      setIsSidebarOpen(true);
-    }
-  }, []);
-
   useEffect(() => {
     return () => {
+      abortBackgroundPostProcessing();
       assistantSelectRequestRef.current += 1;
       if (actionErrorTimerRef.current) {
         clearTimeout(actionErrorTimerRef.current);
         actionErrorTimerRef.current = null;
       }
     };
-  }, []);
+  }, [abortBackgroundPostProcessing]);
+
+  useEffect(
+    () => () => abortBackgroundPostProcessing(),
+    [abortBackgroundPostProcessing, currentSessionId],
+  );
 
   // Ensure a session exists on mount
   useEffect(() => {
@@ -754,6 +611,12 @@ const ChatApp = () => {
     }, 5000);
   };
 
+  useEffect(() => {
+    if (activeSessionLoadError === "session_load_failed") {
+      showActionError(t("errLoadChat"));
+    }
+  }, [activeSessionLoadError, t]);
+
   const syncActiveSessionWithNotice = async (
     sessionId: string,
     logMessage: string,
@@ -767,6 +630,7 @@ const ChatApp = () => {
   };
 
   const stopActiveGenerationWithFeedback = async () => {
+    abortBackgroundPostProcessing();
     try {
       await stopActiveGeneration();
     } catch (error) {
@@ -817,6 +681,8 @@ const ChatApp = () => {
     session: typeof currentSession | null | undefined,
     text: string,
     attachments: Attachment[],
+    signal: AbortSignal,
+    existingMemoryContext?: Message["memoryContext"],
   ) => {
     const effectiveContext = getEffectiveContextForSession(session);
     const processedData = await processMessageForSending({
@@ -826,26 +692,46 @@ const ChatApp = () => {
       modelMetadata,
       customModelMetadata,
       ragConfig: rag,
+      ragEnabled: chatConfig.useRAG !== false,
       knowledgeCollections,
       workspaceKnowledgeCollectionIds:
         effectiveContext.workspaceKnowledgeCollectionIds,
+      signal,
     });
 
     const memoryState = useMemoryStore.getState();
-    const directMemoryContext =
-      memoryState._hasHydrated &&
-      memoryState.settings.enabled &&
-      memoryState.settings.searchEnabled
+    const directMemoryContext = existingMemoryContext?.promptContext
+      ? {
+          text: existingMemoryContext.promptContext,
+          injectedMemoryIds: existingMemoryContext.injectedMemoryIds,
+        }
+      : memoryState._hasHydrated &&
+          memoryState.settings.enabled &&
+          memoryState.settings.searchEnabled
         ? buildDirectMemoryPromptContext({
             memories: memoryState.memories,
             query: text,
-            alreadyInjectedMemoryIds:
-              session?.memoryContext?.injectedMemoryIds || [],
+            alreadyInjectedMemoryIds: getSuppressedMemoryIds(
+              session,
+              useChatStore.getState().activeMessages,
+            ),
           })
         : { text: "", injectedMemoryIds: [] };
+    const memoryContext =
+      directMemoryContext.text &&
+      directMemoryContext.injectedMemoryIds.length > 0
+        ? {
+            injectedMemoryIds: directMemoryContext.injectedMemoryIds,
+            promptContext: directMemoryContext.text,
+            createdAt: existingMemoryContext?.createdAt || Date.now(),
+          }
+        : undefined;
 
     return {
       ...processedData,
+      userMessage: memoryContext
+        ? { ...processedData.userMessage, memoryContext }
+        : processedData.userMessage,
       finalText: directMemoryContext.text
         ? appendContextToChatInput(
             processedData.finalText,
@@ -879,9 +765,16 @@ const ChatApp = () => {
   };
 
   const handleSendMessage = async (text: string, attachments: Attachment[]) => {
-    if ((!text.trim() && attachments.length === 0) || isGenerating) return;
+    const chatState = useChatStore.getState();
+    if (
+      (!text.trim() && attachments.length === 0) ||
+      isGenerating ||
+      chatState.isActiveSessionLoading
+    ) {
+      return;
+    }
 
-    let targetSessionId = currentSessionId;
+    let targetSessionId = chatState.currentSessionId;
 
     if (!targetSessionId) {
       targetSessionId = createSession();
@@ -908,6 +801,7 @@ const ChatApp = () => {
       shouldAutoRename = true;
     }
 
+    abortBackgroundPostProcessing();
     const generation = beginActiveGeneration();
 
     const modelDisplayName = getModelDisplayName(
@@ -929,12 +823,14 @@ const ChatApp = () => {
         sessionForProcessing,
         text,
         attachments,
+        generation.controller.signal,
       );
 
       const {
         finalText,
         finalAttachments,
         ragSources,
+        ragError,
         userMessage,
         injectedMemoryIds,
       } = processedData;
@@ -952,7 +848,11 @@ const ChatApp = () => {
       if (!isGenerationRunActive(generation)) return;
 
       // Add Placeholder Bot Message
-      const botMsg = createBotMessagePlaceholder(modelDisplayName, ragSources);
+      const botMsg = createBotMessagePlaceholder(
+        modelDisplayName,
+        ragSources,
+        ragError,
+      );
       const currentBotMsgId = botMsg.id;
       botMsgId = currentBotMsgId;
       startTime = botMsg.timestamp;
@@ -989,6 +889,7 @@ const ChatApp = () => {
         selectedModel,
         modelMetadata,
         customModelMetadata,
+        searchCompatibility: effectiveContext.searchCompatibility,
       });
       const skillResolution = await resolveSkillsForMessage({
         message: text,
@@ -1099,6 +1000,7 @@ const ChatApp = () => {
       // --- Post-Generation ---
       // Force sync active messages to storage at end of generation
       await syncActiveSession(targetSessionId);
+      if (!isGenerationRunActive(generation)) return;
 
       const postGenerationState = useChatStore.getState();
       const postGenerationSession = postGenerationState.sessions.find(
@@ -1121,21 +1023,28 @@ const ChatApp = () => {
             content: completedBotMessage.content,
           }
         : null;
+      const postProcessSignal = beginBackgroundPostProcessing();
 
       if (completedBotMessage) {
-        queueMemoryExtraction(targetSessionId, userMessage, {
-          id: completedBotMessage.id,
-          content: completedBotMessage.content,
-        });
+        queueMemoryExtraction(
+          targetSessionId,
+          userMessage,
+          {
+            id: completedBotMessage.id,
+            content: completedBotMessage.content,
+          },
+          postProcessSignal,
+        );
       }
 
       // 1. Follow-up Questions
       if (system.enableRelatedQuestions && updatedHistory.length > 0) {
         loadChatService()
           .then(({ generateRelatedQuestions }) =>
-            generateRelatedQuestions(updatedHistory),
+            generateRelatedQuestions(updatedHistory, postProcessSignal),
           )
           .then((questions) => {
+            if (postProcessSignal.aborted) return;
             const state = useChatStore.getState();
             const currentMessage =
               state.currentSessionId === targetSessionId
@@ -1159,6 +1068,7 @@ const ChatApp = () => {
             }
           })
           .catch((err) => {
+            if (postProcessSignal.aborted) return;
             logChatAppError("Related question generation failed:", err);
           });
       }
@@ -1166,8 +1076,11 @@ const ChatApp = () => {
       // 2. Auto-Rename
       if (shouldAutoRename && updatedHistory.length > 0) {
         loadChatService()
-          .then(({ generateChatTitle }) => generateChatTitle(updatedHistory))
+          .then(({ generateChatTitle }) =>
+            generateChatTitle(updatedHistory, postProcessSignal),
+          )
           .then((newTitle) => {
+            if (postProcessSignal.aborted) return;
             const currentSession = useChatStore
               .getState()
               .sessions.find((session) => session.id === targetSessionId);
@@ -1179,6 +1092,7 @@ const ChatApp = () => {
             }
           })
           .catch((err) => {
+            if (postProcessSignal.aborted) return;
             logChatAppError("Chat title generation failed:", err);
           });
       }
@@ -1195,9 +1109,11 @@ const ChatApp = () => {
               updatedHistory,
               postGenerationSession.compression,
               selectedModel,
+              postProcessSignal,
             ),
           )
           .then((newCompression) => {
+            if (postProcessSignal.aborted) return;
             const currentSession = useChatStore
               .getState()
               .sessions.find((session) => session.id === targetSessionId);
@@ -1212,6 +1128,7 @@ const ChatApp = () => {
             }
           })
           .catch((err) => {
+            if (postProcessSignal.aborted) return;
             logChatAppError("Context compression failed:", err);
           });
       }
@@ -1284,7 +1201,13 @@ const ChatApp = () => {
       logPrefix: string;
     },
   ) => {
-    if (isGenerating || !currentSessionId) return;
+    if (
+      isGenerating ||
+      !currentSessionId ||
+      useChatStore.getState().isActiveSessionLoading
+    ) {
+      return;
+    }
 
     const sessionMessages = activeMessages;
     if (!sessionMessages) return;
@@ -1318,6 +1241,7 @@ const ChatApp = () => {
       showActionError(errorMessage);
       return;
     }
+    abortBackgroundPostProcessing();
     const generation = beginActiveGeneration();
     const startTime = Date.now();
 
@@ -1327,13 +1251,17 @@ const ChatApp = () => {
         finalText,
         finalAttachments,
         ragSources,
+        ragError,
         effectiveContext,
         injectedMemoryIds,
       } = await processPromptForModel(
         sessionMeta,
         promptText,
         promptAttachments,
+        generation.controller.signal,
+        lastUserMsg.memoryContext,
       );
+      if (!isGenerationRunActive(generation)) return;
       commitInjectedMemoryContext(
         currentSessionId,
         sessionMeta,
@@ -1348,9 +1276,11 @@ const ChatApp = () => {
         autoSelect: skillAutoSelect,
         signal: generation.controller.signal,
       });
-      if (ragSources.length > 0) {
+      if (!isGenerationRunActive(generation)) return;
+      if (ragSources.length > 0 || ragError) {
         updateMessage(currentSessionId, branchMessageId, {
           ragSources,
+          ragError,
         });
       }
       if (skillResolution.invocations.length > 0) {
@@ -1382,6 +1312,7 @@ const ChatApp = () => {
           selectedModel,
           modelMetadata,
           customModelMetadata,
+          searchCompatibility: effectiveContext.searchCompatibility,
         }),
         (streamText, streamReasoning, outputBlocks) => {
           if (!isGenerationRunActive(generation)) return;
@@ -1461,14 +1392,21 @@ const ChatApp = () => {
       });
 
       await syncActiveSession(currentSessionId);
+      if (!isGenerationRunActive(generation)) return;
+      const postProcessSignal = beginBackgroundPostProcessing();
       const completedBranchMessage = useChatStore
         .getState()
         .activeMessages.find((message) => message.id === branchMessageId);
       if (completedBranchMessage) {
-        queueMemoryExtraction(currentSessionId, lastUserMsg, {
-          id: completedBranchMessage.id,
-          content: completedBranchMessage.content,
-        });
+        queueMemoryExtraction(
+          currentSessionId,
+          lastUserMsg,
+          {
+            id: completedBranchMessage.id,
+            content: completedBranchMessage.content,
+          },
+          postProcessSignal,
+        );
       }
     } catch (error: any) {
       if (error.name === "AbortError" || generation.controller.signal.aborted) {
@@ -1506,7 +1444,7 @@ const ChatApp = () => {
   };
 
   const handleVersionChange = (msgId: string, direction: "prev" | "next") => {
-    if (currentSessionId) {
+    if (currentSessionId && !useChatStore.getState().isActiveSessionLoading) {
       switchMessageVersion(currentSessionId, msgId, direction);
     }
   };
@@ -1555,11 +1493,12 @@ const ChatApp = () => {
       }
     }
 
+    abortBackgroundPostProcessing();
     createSession(instruction, agent.meta.title);
   };
 
   const handleEditMessage = (msgId: string, newContent: string) => {
-    if (currentSessionId) {
+    if (currentSessionId && !useChatStore.getState().isActiveSessionLoading) {
       updateMessageContent(currentSessionId, msgId, newContent);
       void syncActiveSessionWithNotice(
         currentSessionId,
@@ -1573,7 +1512,14 @@ const ChatApp = () => {
     newContent: string,
   ) => {
     const sessionId = currentSessionId;
-    if (!sessionId || isGenerating || !newContent.trim()) return;
+    if (
+      !sessionId ||
+      isGenerating ||
+      useChatStore.getState().isActiveSessionLoading ||
+      !newContent.trim()
+    ) {
+      return;
+    }
 
     const sessionMessages = activeMessages;
     const msgIndex = sessionMessages.findIndex(
@@ -1586,6 +1532,7 @@ const ChatApp = () => {
     }
     if (newContent === sourceMessage.content) return;
 
+    abortBackgroundPostProcessing();
     const generation = beginActiveGeneration();
     let modelMessageId: string | null = null;
     let editedUserMessageId: string | null = null;
@@ -1597,6 +1544,7 @@ const ChatApp = () => {
         finalText,
         finalAttachments,
         ragSources,
+        ragError,
         userMessage,
         effectiveContext,
         injectedMemoryIds,
@@ -1604,6 +1552,7 @@ const ChatApp = () => {
         sessionMeta,
         newContent,
         sourceMessage.attachments || [],
+        generation.controller.signal,
       );
       if (!isGenerationRunActive(generation)) return;
       commitInjectedMemoryContext(sessionId, sessionMeta, injectedMemoryIds);
@@ -1626,6 +1575,7 @@ const ChatApp = () => {
       const modelPlaceholder = createBotMessagePlaceholder(
         modelDisplayName,
         ragSources,
+        ragError,
       );
       startTime = modelPlaceholder.timestamp;
 
@@ -1672,6 +1622,7 @@ const ChatApp = () => {
           selectedModel,
           modelMetadata,
           customModelMetadata,
+          searchCompatibility: effectiveContext.searchCompatibility,
         }),
         (streamText, streamReasoning, outputBlocks) => {
           if (!isGenerationRunActive(generation) || !modelMessageId) return;
@@ -1760,6 +1711,8 @@ const ChatApp = () => {
       });
 
       await syncActiveSession(sessionId);
+      if (!isGenerationRunActive(generation)) return;
+      const postProcessSignal = beginBackgroundPostProcessing();
       const completedModelMessage = useChatStore
         .getState()
         .activeMessages.find((message) => message.id === modelMessageId);
@@ -1771,6 +1724,7 @@ const ChatApp = () => {
             id: completedModelMessage.id,
             content: completedModelMessage.content,
           },
+          postProcessSignal,
         );
       }
     } catch (error: any) {
@@ -1807,7 +1761,7 @@ const ChatApp = () => {
 
   const handleDeleteMessage = async (msgId: string) => {
     const sessionId = currentSessionId;
-    if (!sessionId) return;
+    if (!sessionId || useChatStore.getState().isActiveSessionLoading) return;
 
     try {
       await deleteMessage(sessionId, msgId);
@@ -1819,6 +1773,9 @@ const ChatApp = () => {
 
   const handleDeleteSession = async (sessionId: string) => {
     try {
+      if (sessionId === currentSessionId) {
+        abortBackgroundPostProcessing();
+      }
       if (
         shouldAbortActiveGenerationForSessionDelete({
           currentSessionId,
@@ -1837,7 +1794,10 @@ const ChatApp = () => {
   };
 
   const handleDuplicateSession = async (sessionId: string) => {
+    if (isGenerating || useChatStore.getState().isActiveSessionLoading) return;
+
     try {
+      abortBackgroundPostProcessing();
       await duplicateSession(sessionId);
     } catch (error) {
       logChatAppError("Failed to duplicate session", error);
@@ -1847,7 +1807,7 @@ const ChatApp = () => {
 
   const handleRetractMessage = async (msg: Message) => {
     const sessionId = currentSessionId;
-    if (!sessionId) return;
+    if (!sessionId || useChatStore.getState().isActiveSessionLoading) return;
 
     try {
       await deleteMessageAndSubsequent(sessionId, msg.id);
@@ -1903,12 +1863,18 @@ const ChatApp = () => {
   };
 
   const handleNewChat = () => {
+    abortBackgroundPostProcessing();
     if (isGenerating) {
       void stopActiveGenerationWithFeedback();
     }
 
     createSession();
     navigateToPanel("chat");
+  };
+
+  const handleSelectSession = async (sessionId: string) => {
+    abortBackgroundPostProcessing();
+    await selectSession(sessionId);
   };
 
   const handleSuggestionClick = (question: string) => {
@@ -1918,282 +1884,56 @@ const ChatApp = () => {
   // --- Render ---
 
   return (
-    <div className="relative flex h-dvh w-full overflow-hidden bg-background font-sans text-foreground transition-colors duration-300">
-      <a className="skip-link" href="#main-chat">
-        {t("skipToChat")}
-      </a>
-      <ImagePreview />
-
-      {/* Sidebar Drawer Overlay Mask */}
-      {isSidebarDrawerOpen && (
-        <div
-          className="fixed inset-0 z-30 bg-black/10 transition-opacity duration-200 dark:bg-black/50 lg:hidden"
-          onClick={() => setIsSidebarOpen(false)}
-          aria-hidden="true"
-        />
-      )}
-
-      {/* Sidebar */}
-      <Sidebar
-        sessions={sessions}
-        currentSessionId={currentSessionId}
-        onSelectSession={(id) => {
-          if (isGenerating) {
-            void stopActiveGenerationWithFeedback();
-          }
-          selectSession(id);
-          navigateToPanel("chat");
-        }}
-        onNewChat={handleNewChat}
-        onDeleteSession={handleDeleteSession}
-        onRenameSession={updateSessionTitle}
-        onTogglePin={toggleSessionPin}
-        onDuplicate={handleDuplicateSession}
-        onSmartRename={handleSmartRename}
-        isOpen={isSidebarOpen}
-        toggleSidebar={() => setIsSidebarOpen((open) => !open)}
-        isModal={isSidebarDrawerOpen}
-        onRequestClose={() => setIsSidebarOpen(false)}
-        onOpenPluginMarket={() => navigateToPanel("plugins")}
-        isPluginMarketOpen={viewMode === "plugins"}
-        onOpenSkillMarket={() => navigateToPanel("skills")}
-        isSkillMarketOpen={viewMode === "skills"}
-        onOpenAssistantHub={() => navigateToPanel("assistants")}
-        isAssistantHubOpen={viewMode === "assistants"}
-        onOpenKnowledgeBase={() => navigateToPanel("knowledge")}
-        isKnowledgeBaseOpen={viewMode === "knowledge"}
-        onOpenSettings={() => navigateToPanel("settings", "system")}
-        isSettingsOpen={viewMode === "settings"}
-        onLogoClick={() => navigateToPanel("chat")}
-      />
-
-      {/* Main Chat Area */}
-      <main
-        {...mainInertProps}
-        id="main-chat"
-        tabIndex={-1}
-        className="flex-1 flex flex-col h-full relative z-0 min-w-0 overflow-hidden md:pl-16 lg:pl-0"
-      >
-        {actionError && (
-          <div
-            role="alert"
-            className="absolute top-16 left-4 right-4 z-30 pointer-events-none"
-          >
-            <div className="mx-auto max-w-3xl rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700 shadow-sm dark:border-red-900/60 dark:bg-red-950/90 dark:text-red-100">
-              {actionError}
-            </div>
-          </div>
-        )}
-        {viewMode === "plugins" ? (
-          <PluginMarket onClose={() => navigateToPanel("chat")} />
-        ) : viewMode === "skills" ? (
-          <SkillMarket onClose={() => navigateToPanel("chat")} />
-        ) : viewMode === "assistants" ? (
-          <AssistantHub
-            onClose={() => navigateToPanel("chat")}
-            onSelect={handleAssistantSelect}
-          />
-        ) : viewMode === "knowledge" ? (
-          <KnowledgeBase onClose={() => navigateToPanel("chat")} />
-        ) : viewMode === "settings" ? (
-          <SettingsPage
-            activeTab={settingsTab}
-            onTabChange={handleSettingsTabChange}
-            onClose={() => navigateToPanel("chat")}
-          />
-        ) : (
-          <>
-            {/* Header */}
-            <header className="relative z-10 flex h-14 items-center justify-between px-4 md:px-6">
-              <div className="flex min-w-10 items-center">
-                <Tooltip
-                  content={isSidebarOpen ? t("closeSidebar") : t("openSidebar")}
-                  position="right"
-                  className="md:hidden"
-                >
-                  <button
-                    type="button"
-                    aria-label={
-                      isSidebarOpen
-                        ? t("closeSidebarAria")
-                        : t("openSidebarAria")
-                    }
-                    onClick={() => setIsSidebarOpen((open) => !open)}
-                    className="p-2 -ml-2 rounded-lg text-muted-foreground transition-colors hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
-                  >
-                    {isSidebarOpen ? (
-                      <PanelLeftClose size={16} aria-hidden="true" />
-                    ) : (
-                      <PanelLeftOpen size={16} aria-hidden="true" />
-                    )}
-                  </button>
-                </Tooltip>
-              </div>
-
-              {shouldShowChatTitleBar && (
-                <div className="absolute left-1/2 top-1/2 max-w-[50%] -translate-x-1/2 -translate-y-1/2 truncate text-center font-bold text-foreground">
-                  {currentSession?.title || t("newChat")}
-                </div>
-              )}
-
-              <div className="flex items-center justify-end min-w-10">
-                {!isSidebarOpen && (
-                  <Tooltip content={t("newChat")} position="left">
-                    <button
-                      type="button"
-                      aria-label={t("newChatAria")}
-                      onClick={handleNewChat}
-                      className="p-2 -mr-2 rounded-lg text-muted-foreground transition-colors hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
-                    >
-                      <MessageSquarePlus size={16} aria-hidden="true" />
-                    </button>
-                  </Tooltip>
-                )}
-              </div>
-            </header>
-
-            {/* Content */}
-            <div
-              ref={messagesScrollRef}
-              onScroll={updateIsNearMessageBottom}
-              className="flex-1 px-4 md:px-8 pt-4 md:pt-6 pb-[calc(8rem+env(safe-area-inset-bottom))] relative motion-safe:scroll-smooth scrollbar-overlay"
-            >
-              <div className="w-full max-w-3xl mx-auto min-h-full flex flex-col">
-                {/* Assistant / System Instruction Header */}
-                {currentSession &&
-                  (messages.length > 0 ||
-                    !!currentSession.systemInstruction) && (
-                    <AssistantHeader
-                      instruction={currentSession.systemInstruction || ""}
-                      onUpdate={(newInst) =>
-                        updateSessionInstruction(currentSession.id, newInst)
-                      }
-                      onDelete={
-                        currentSession.systemInstruction
-                          ? () =>
-                              updateSessionInstruction(currentSession.id, "")
-                          : undefined
-                      }
-                    />
-                  )}
-
-                {/* Empty State */}
-                {(welcomeState === "visible" || welcomeState === "exiting") && (
-                  <div
-                    className={`emptyChatSurface flex-1 motion-safe:transition-[opacity,transform] motion-safe:duration-300 motion-safe:transform origin-center ${
-                      welcomeState === "exiting"
-                        ? "opacity-0 scale-95 pointer-events-none"
-                        : "opacity-100 scale-100"
-                    }`}
-                  />
-                )}
-
-                {/* Message Stream */}
-                {welcomeState === "hidden" && (
-                  <div className="space-y-1 motion-safe:animate-in motion-safe:fade-in motion-safe:duration-500 fill-mode-forwards">
-                    {messages.map((msg, idx) => {
-                      const isLastUserMessage =
-                        msg.role === "user" &&
-                        !messages.slice(idx + 1).some((m) => m.role === "user");
-                      const isLastMessage = idx === messages.length - 1;
-
-                      return (
-                        <React.Fragment key={msg.id}>
-                          <div className="[content-visibility:auto] [contain-intrinsic-size:0_240px]">
-                            <MessageItem
-                              message={msg}
-                              branchInfo={getMessageBranchInfo(
-                                activeMessageTree,
-                                msg.id,
-                              )}
-                              onEdit={handleEditMessage}
-                              onDelete={handleDeleteMessage}
-                              canEditUserMessage={
-                                msg.role === "user" && !isLastUserMessage
-                              }
-                              onSubmitUserEdit={handleSubmitUserMessageEdit}
-                              onRetract={
-                                isLastUserMessage
-                                  ? () => handleRetractMessage(msg)
-                                  : undefined
-                              }
-                              isLast={isLastMessage}
-                              isTyping={isGenerating && isLastMessage}
-                              onRegenerate={() => handleRegenerate(msg.id)}
-                              onVersionChange={handleVersionChange}
-                            />
-                          </div>
-                          {msg.role === "model" &&
-                            isLastMessage &&
-                            !isGenerating &&
-                            msg.suggestedQuestions &&
-                            msg.suggestedQuestions.length > 0 && (
-                              <FollowUpQuestions
-                                questions={msg.suggestedQuestions}
-                                onClick={handleSuggestionClick}
-                              />
-                            )}
-                        </React.Fragment>
-                      );
-                    })}
-
-                    <div ref={messagesEndRef} />
-                  </div>
-                )}
-              </div>
-            </div>
-
-            <div className="w-full h-4 md:h-6"></div>
-
-            {/* Input Area */}
-            <div
-              className={`absolute left-0 right-0 z-20 px-4 pointer-events-none md:px-8 motion-safe:transition-[bottom,padding-bottom] motion-safe:duration-300 ${
-                welcomeState === "visible"
-                  ? "bottom-[40vh] pb-0 md:bottom-[32vh] md:pb-0"
-                  : "bottom-0 pb-[calc(1rem+env(safe-area-inset-bottom))] md:pb-6"
-              }`}
-            >
-              <div
-                className={`flex w-full mx-auto pointer-events-auto flex-col items-center motion-safe:transition-[max-width] motion-safe:duration-300 ${
-                  welcomeState === "visible" ? "max-w-2xl" : "max-w-3xl"
-                }`}
-              >
-                {(welcomeState === "visible" || welcomeState === "exiting") && (
-                  <div
-                    className={`mb-3 md:mb-5 flex items-center gap-3 text-center motion-safe:transition-[opacity,transform] motion-safe:duration-300 ${
-                      welcomeState === "exiting"
-                        ? "pointer-events-none opacity-0 scale-95"
-                        : "opacity-100 scale-100"
-                    }`}
-                  >
-                    <div className="flex h-10 w-10 shrink-0 items-center justify-center md:h-11 md:w-11">
-                      <Logo className="h-10 w-10 md:h-11 md:w-11" />
-                    </div>
-                    <h1 className="neoChatWordmark bg-clip-text text-[1.75rem] font-bold leading-none tracking-[0.01em] text-transparent bg-[linear-gradient(to_right,#00DEB9,#03B2DE,#1D88E1)]">
-                      {t("productName")}
-                    </h1>
-                  </div>
-                )}
-                <MessageInput
-                  ref={messageInputRef}
-                  variant={messageInputVariant}
-                  onSend={handleSendMessage}
-                  onStop={isGenerating ? handleStopGeneration : undefined}
-                  disabled={isGenerating || availableModels.length === 0}
-                  availableModels={availableModels}
-                  selectedModel={selectedModel}
-                  onSelectModel={setModel}
-                  isSearchEnabled={chatConfig.useSearch}
-                  onToggleSearch={() =>
-                    setChatConfig({ useSearch: !chatConfig.useSearch })
-                  }
-                />
-              </div>
-            </div>
-          </>
-        )}
-      </main>
-    </div>
+    <ChatAppShell
+      actionError={actionError}
+      sessions={sessions}
+      currentSessionId={currentSessionId}
+      currentSession={currentSession}
+      messages={messages}
+      activeMessageTree={activeMessageTree}
+      isGenerating={isGenerating}
+      isActiveSessionLoading={isActiveSessionLoading}
+      availableModels={availableModels}
+      selectedModel={selectedModel}
+      isSearchEnabled={chatConfig.useSearch}
+      viewMode={viewMode}
+      settingsTab={settingsTab}
+      isSidebarOpen={isSidebarOpen}
+      isNonDesktopViewport={isNonDesktopViewport}
+      isSidebarDrawerOpen={isSidebarDrawerOpen}
+      mainInertProps={mainInertProps}
+      shouldShowChatTitleBar={shouldShowChatTitleBar}
+      welcomeState={welcomeState}
+      messageInputVariant={messageInputVariant}
+      messagesScrollRef={messagesScrollRef}
+      messagesEndRef={messagesEndRef}
+      messageInputRef={messageInputRef}
+      setIsSidebarOpen={setIsSidebarOpen}
+      navigateToPanel={navigateToPanel}
+      handleSettingsTabChange={handleSettingsTabChange}
+      updateIsNearMessageBottom={updateIsNearMessageBottom}
+      stopActiveGenerationWithFeedback={stopActiveGenerationWithFeedback}
+      selectSession={handleSelectSession}
+      handleNewChat={handleNewChat}
+      handleDeleteSession={handleDeleteSession}
+      updateSessionTitle={updateSessionTitle}
+      toggleSessionPin={toggleSessionPin}
+      handleDuplicateSession={handleDuplicateSession}
+      handleSmartRename={handleSmartRename}
+      handleAssistantSelect={handleAssistantSelect}
+      updateSessionInstruction={updateSessionInstruction}
+      handleEditMessage={handleEditMessage}
+      handleDeleteMessage={handleDeleteMessage}
+      handleSubmitUserMessageEdit={handleSubmitUserMessageEdit}
+      handleRetractMessage={handleRetractMessage}
+      handleRegenerate={handleRegenerate}
+      handleVersionChange={handleVersionChange}
+      handleSendMessage={handleSendMessage}
+      handleSuggestionClick={handleSuggestionClick}
+      handleStopGeneration={handleStopGeneration}
+      setModel={setModel}
+      onToggleSearch={() => setChatConfig({ useSearch: !chatConfig.useSearch })}
+    />
   );
 };
 

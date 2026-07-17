@@ -8,11 +8,12 @@ import {
 } from "./manifest";
 import { safeFetchText } from "../security/safeFetch";
 import {
+  getProviderGoogleSdkOptions,
   getSafeUrlPolicy,
   normalizeProviderBaseUrl,
   validateOutboundUrl,
 } from "../security/urlPolicy";
-import type { Plugin, PluginFunction } from "../../types";
+import type { Plugin, PluginFunction } from "@/types";
 import {
   AGNES_IMAGE_PLUGIN_ID,
   AGNES_VIDEO_PLUGIN_ID,
@@ -186,7 +187,7 @@ function getPluginEndpointOverride(
 
   const providerType =
     plugin.id === GEMINI_IMAGE_PLUGIN_ID
-      ? "Gemini"
+      ? "Google"
       : plugin.id === OPENAI_IMAGE_PLUGIN_ID ||
           plugin.id === OPENAI_RESPONSES_IMAGE_PLUGIN_ID
         ? "OpenAI Compatible"
@@ -196,6 +197,9 @@ function getPluginEndpointOverride(
 
   try {
     validateOutboundUrl(authConfig.baseUrl, getSafeUrlPolicy("plugin"));
+    if (plugin.id === GEMINI_IMAGE_PLUGIN_ID) {
+      return getProviderGoogleSdkOptions(authConfig.baseUrl).baseUrl;
+    }
     return normalizeProviderBaseUrl(authConfig.baseUrl, providerType);
   } catch {
     return "invalid";
@@ -206,6 +210,92 @@ function removeUndefinedFields(record: Record<string, unknown>) {
   return Object.fromEntries(
     Object.entries(record).filter(([, value]) => value !== undefined),
   );
+}
+
+const FORBIDDEN_AUTH_HEADER_NAMES = new Set([
+  "accept-encoding",
+  "connection",
+  "content-length",
+  "cookie",
+  "host",
+  "proxy-authorization",
+  "sec-fetch-dest",
+  "sec-fetch-mode",
+  "sec-fetch-site",
+  "sec-fetch-user",
+  "te",
+  "trailer",
+  "transfer-encoding",
+  "upgrade",
+]);
+
+function getPluginAuthTarget(
+  plugin: Plugin,
+  authConfig: PluginAuthConfig | undefined,
+): {
+  name: string;
+  location?: "header" | "query";
+  source: "manifest" | "runtime" | "default";
+} {
+  const manifestName = plugin.auth?.name?.trim();
+  if (manifestName) {
+    return {
+      name: manifestName,
+      location: plugin.auth?.in,
+      source: "manifest",
+    };
+  }
+
+  const runtimeName = authConfig?.key?.trim();
+  if (runtimeName) {
+    return {
+      name: runtimeName,
+      location: authConfig?.addTo,
+      source: "runtime",
+    };
+  }
+
+  return {
+    name:
+      plugin.auth?.type === "apiKey" || authConfig?.type === "apiKey"
+        ? "X-API-Key"
+        : "Authorization",
+    location: plugin.auth?.in || authConfig?.addTo,
+    source: "default",
+  };
+}
+
+function getPluginAuthTargetError({
+  name,
+  location,
+  source,
+}: {
+  name: string;
+  location?: "header" | "query";
+  source: "manifest" | "runtime" | "default";
+}): string | null {
+  if (!name) return "Plugin authentication parameter name is required";
+
+  if (location === "header") {
+    if (!/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(name)) {
+      return "Plugin authentication header name is not allowed";
+    }
+    const normalized = name.toLowerCase();
+    if (
+      FORBIDDEN_AUTH_HEADER_NAMES.has(normalized) ||
+      normalized.startsWith("sec-") ||
+      normalized.startsWith("proxy-") ||
+      (source !== "manifest" && normalized === "authorization")
+    ) {
+      return "Plugin authentication header name is not allowed";
+    }
+  }
+
+  if (location === "query" && !/^[A-Za-z0-9._~-]{1,120}$/.test(name)) {
+    return "Plugin authentication query parameter name is not allowed";
+  }
+
+  return null;
 }
 
 function getImageCountArg(args: Record<string, unknown>): number | undefined {
@@ -390,6 +480,7 @@ export async function executePluginFunctionRequest({
   authConfig,
   decryptSecret = decryptOptionalSecret,
   fetchText = safeFetchText,
+  signal,
 }: {
   plugin: Plugin;
   functionDef: PluginFunction;
@@ -397,6 +488,7 @@ export async function executePluginFunctionRequest({
   authConfig?: PluginAuthConfig;
   decryptSecret?: DecryptOptionalSecret;
   fetchText?: SafeFetchText;
+  signal?: AbortSignal;
 }) {
   if (!plugin.baseUrl) {
     return NextResponse.json(
@@ -419,6 +511,13 @@ export async function executePluginFunctionRequest({
   const functionPathError = getPluginFunctionPathError(functionDef);
   if (functionPathError) {
     return NextResponse.json({ error: functionPathError }, { status: 400 });
+  }
+
+  if (!functionDef.method || !functionDef.path) {
+    return NextResponse.json(
+      { error: "Plugin function path or method is missing" },
+      { status: 400 },
+    );
   }
 
   const method = functionDef.method.toUpperCase();
@@ -590,16 +689,18 @@ export async function executePluginFunctionRequest({
   }
 
   if (authValue) {
-    const authName =
-      authConfig?.key ||
-      plugin.auth?.name ||
-      (plugin.auth?.type === "apiKey" ? "X-API-Key" : "Authorization");
-    const authIn = authConfig?.addTo || plugin.auth?.in;
+    const authTarget = getPluginAuthTarget(plugin, authConfig);
+    const authName = authTarget.name;
+    const authIn = authTarget.location;
     const authType = getAuthType(plugin, authConfig);
 
     if (authType === "bearer" || authType === "oauth2") {
       headers.Authorization = `Bearer ${authValue}`;
     } else if (authType === "apiKey" || authConfig?.type === "apiKey") {
+      const authTargetError = getPluginAuthTargetError(authTarget);
+      if (authTargetError) {
+        return NextResponse.json({ error: authTargetError }, { status: 400 });
+      }
       if (authIn === "header") {
         headers[authName] = authValue;
       } else if (authIn === "query") {
@@ -621,6 +722,7 @@ export async function executePluginFunctionRequest({
         method !== "GET"
           ? (requestBody ?? JSON.stringify(outboundArgs))
           : undefined,
+      signal,
     },
     {
       policy: getSafeUrlPolicy("plugin"),
@@ -637,7 +739,7 @@ export async function executePluginFunctionRequest({
         plugin.id === GEMINI_IMAGE_PLUGIN_ID ||
         plugin.id === OPENAI_IMAGE_PLUGIN_ID ||
         plugin.id === OPENAI_RESPONSES_IMAGE_PLUGIN_ID
-          ? 16 * 1024 * 1024
+          ? 36 * 1024 * 1024
           : 2 * 1024 * 1024,
     },
   );
